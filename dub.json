@@ -1,0 +1,9 @@
+{
+	"name": "mongo-standalone",
+	"authors": [
+		"Symmetry Investments"
+	],
+	"description": "A standalone (no dependencies outside the stdlib) Mongo database driver for D.",
+	"copyright": "Copyright © 2020, Symmetry Investments",
+	"license": "Boost"
+}
