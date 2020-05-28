@@ -885,26 +885,26 @@ struct Decimal128 {
 struct Undefined {}
 
 
-struct toStringVisitor {
+struct ToStringVisitor(T) if (isSomeString!T) {
 	import std.conv;
 
 	// of course this could have been a template but I wrote it out long-form for copy/paste purposes
-	string visit(const double v) { return to!string(v); }
-	string visit(const string v) { return to!string(v); }
-	string visit(const document v) { return to!string(v); }
-	string visit(const const(bson_value)[] v) { return to!string(v); }
-	string visit(const ubyte tag, const ubyte[] v) { return to!string(v); }
-	string visit(const ObjectId v) { return to!string(v); }
-	string visit(const bool v) { return to!string(v); }
-	string visit(const UtcTimestamp v) { return to!string(v); }
-	string visit(const typeof(null)) { return "null"; }
-	string visit(const RegEx v) { return to!string(v); }
-	string visit(const Javascript v) { return to!string(v); }
-	string visit(const int v) { return to!string(v); }
-	string visit(const Undefined) { return "undefined"; }
-	string visit(const Timestamp v) { return to!string(v); }
-	string visit(const long v) { return to!string(v); }
-	string visit(const Decimal128 v) { return to!string(v); }
+	T visit(const double v) { return to!T(v); }
+	T visit(const string v) { return to!T(v); }
+	T visit(const document v) { return to!T(v); }
+	T visit(const const(bson_value)[] v) { return to!T(v); }
+	T visit(const ubyte tag, const ubyte[] v) { return to!T(v); }
+	T visit(const ObjectId v) { return to!T(v); }
+	T visit(const bool v) { return to!T(v); }
+	T visit(const UtcTimestamp v) { return to!T(v); }
+	T visit(const typeof(null)) { return to!T(null); }
+	T visit(const RegEx v) { return to!T(v); }
+	T visit(const Javascript v) { return to!T(v); }
+	T visit(const int v) { return to!T(v); }
+	T visit(const Undefined) { return "undefined".to!T; }
+	T visit(const Timestamp v) { return to!T(v); }
+	T visit(const long v) { return to!T(v); }
+	T visit(const Decimal128 v) { return to!T(v); }
 }
 
 struct get_visitor(T) {
@@ -1049,8 +1049,8 @@ struct bson_value {
 	}
 
 	string toString() const {
-		toStringVisitor v;
-		return visit!toStringVisitor(v);
+		ToStringVisitor!string v;
+		return visit(v);
 	}
 
 	private union {
