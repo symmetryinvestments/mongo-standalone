@@ -806,6 +806,10 @@ struct document {
 			bytesCount += v.size;
 	}
 
+	size_t length() const {
+		return values_.length;
+	}
+
 	const(bson_value)[] values() const {
 		return values_;
 	}
