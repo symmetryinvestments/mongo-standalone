@@ -1,5 +1,7 @@
 module kaleidic.mongo_standalone;
 
+import std.array;
+import std.bitmanip;
 import std.socket;
 
 static immutable string mongoDriverName = "mongo-standalone";
@@ -69,7 +71,7 @@ enum WireVersion {
 class MongoConnection {
 
 	Socket socket;
-	ReceiveStream stream;
+	IReceiveStream stream;
 
 	uint defaultQueryFlags;
 
@@ -259,7 +261,7 @@ class MongoConnection {
 			socket = new TcpSocket(new InternetAddress(host, cast(ushort) uri.port));
 		}
 
-		stream = new ReceiveStream(socket);
+		stream = new SocketReceiveStream(socket);
 
 		document appArgs;
 		if (appName.length)
@@ -463,13 +465,8 @@ class MongoConnection {
 	}
 }
 
-class ReceiveStream {
-	this(Socket socket) {
-		this.socket = socket;
-	}
-
-
-	OP_REPLY readReply() {
+interface IReceiveStream {
+	final OP_REPLY readReply() {
 		OP_REPLY reply;
 
 		reply.header.messageLength = readInt();
@@ -492,7 +489,7 @@ class ReceiveStream {
 		return reply;
 	}
 
-	document readBson() {
+	final document readBson() {
 		document d;
 		d.bytesCount = readInt();
 
@@ -511,7 +508,7 @@ class ReceiveStream {
 		return d;
 	}
 
-	bson_value readBsonValue(ref int remaining) {
+	final bson_value readBsonValue(ref int remaining) {
 		bson_value v;
 
 		v.tag = readByte();
@@ -602,109 +599,222 @@ class ReceiveStream {
 		return v;
 	}
 
+	final ubyte readByte() {
+		return readSmall!1[0];
+	}
+
+	final int readInt() {
+		return readSmall!4.littleEndianToNative!int;
+	}
+
+	final long readLong() {
+		return readSmall!8.littleEndianToNative!long;
+	}
+
+	final double readDouble() {
+		return readSmall!8.littleEndianToNative!double;
+	}
+	
+	final string readZeroTerminatedChars() {
+		return cast(string) readUntilNull();
+	}
+
+	final string readCharsWithLengthPrefix() {
+		auto length = readInt();
+		// length prefixed string allows 0 characters
+		auto bytes = readBytes(length);
+		if (bytes[$ - 1] != 0)
+			throw new Exception("Malformed length prefixed string");
+		return cast(string)bytes[0 .. $ - 1];
+	}
+
+	/// Reads exactly the amount of bytes specified and returns a newly
+	/// allocated buffer containing the data.
+	final immutable(ubyte)[] readBytes(size_t length) {
+		ubyte[] ret = new ubyte[length];
+		readExact(ret);
+		return (() @trusted => cast(immutable)ret)();
+	}
+
+	/// Reads a small number of bytes into a stack allocated array. Convenience
+	/// function calling $(LREF readExact).
+	ubyte[n] readSmall(size_t n)() {
+		ubyte[n] buf;
+		readExact(buf[]);
+		return buf;
+	}
+
+	/// Reads exactly the expected length into the given buffer argument.
+	void readExact(scope ubyte[] buffer);
+
+	/// Reads until a 0 byte and returns all data before it as newly allocated
+	/// buffer containing the data.
+	immutable(ubyte)[] readUntilNull();
+}
+
+class SocketReceiveStream : IReceiveStream {
+	this(Socket socket) {
+		this.socket = socket;
+	}
 
 	Socket socket;
 	ubyte[4096] buffer;
-	size_t bufferLength;
+	// if bufferLength > bufferPos then following data is linear after bufferPos
+	// if bufferLength < bufferPos then data is following bufferPos and also from 0..bufferLength
+	// if bufferLength == bufferPos then all data is read
+	int bufferLength;
+	// may only increment until at the end of buffer.length, where it wraps back to 0
 	int bufferPos;
 
-	void loadMore() {
-		if(bufferPos == bufferLength) {
-			bufferPos = 0;
-			bufferLength = 0;
-		}
-		auto ret = socket.receive(buffer[bufferLength .. $]);
-		if (ret == 0)
+	protected ptrdiff_t receiveSocket(ubyte[] buffer) {
+		const length = socket.receive(buffer);
+
+		if (length == 0)
 			throw new Exception("Remote side has closed the connection");
-		else if (ret == Socket.ERROR)
+		else if (length == Socket.ERROR)
 			throw new Exception(lastSocketError());
-		bufferLength += ret;
-	}
-	void loadAtLeast(int needed) {
-		while(bufferLength - bufferPos < needed)
-			loadMore();
+		else
+			return length;
 	}
 
-	ubyte readByte() {
-		loadAtLeast(1);
-		return buffer[bufferPos++];
-	}
-
-	int readInt() {
-		loadAtLeast(4);
-		uint a;
-		int shift;
-		foreach(i; 0 .. 4) {
-			a |= (cast(uint) buffer[bufferPos++]) << shift;
-			shift += 8;
-		}
-		return a;
-	}
-
-	long readLong() {
-		loadAtLeast(8);
-		ulong a;
-		int shift;
-		foreach(i; 0 .. 8) {
-			a |= (cast(ulong) buffer[bufferPos++]) << shift;
-			shift += 8;
-		}
-		return a;
-	}
-
-	double readDouble() {
-		auto a = readLong();
-		return *(cast(double*) &a);
-	}
-
-	string readZeroTerminatedChars() {
-		string ret;
-
-		got_more:
-		auto start = bufferPos;
-		while(bufferPos < bufferLength) {
-			if(buffer[bufferPos] == 0) {
-				ret ~= cast(char[]) buffer[start .. bufferPos];
-				bufferPos++; // skip the zero term
-				return ret;
-			}
-			bufferPos++;
-		}
-
-		ret ~= cast(char[]) buffer[bufferPos .. bufferLength];
-		bufferPos = 0;
-		bufferLength = 0;
-		loadMore();
-		goto got_more;
-	}
-
-	string readCharsWithLengthPrefix() {
-		auto length = readInt();
-		auto got = readZeroTerminatedChars();
-		if(got.length + 1 != length)
-			throw new Exception("length mismatch, wtf");
-		return got;
-	}
-
-	ubyte[] readBytes(int length) {
-		ubyte[] ret;
-
-		got_more:
-		if(bufferPos + length < bufferLength) {
-			ret ~= buffer[bufferPos .. bufferPos + length];
-			bufferPos += length;
-			return ret;
-		} else {
-			ret ~= buffer[bufferPos .. bufferLength];
-			length -= bufferLength - bufferPos;
+	/// Loads more data after bufferPos if there is space, otherwise load before
+	/// bufferPos, indicating data is wrapping around.
+	void loadMore() {
+		if (bufferPos == bufferLength) {
+			// we read up all the bytes, start back from 0 for bigger recv buffer
 			bufferPos = 0;
 			bufferLength = 0;
+		}
+
+		ptrdiff_t length;
+		if (bufferLength < bufferPos) {
+			// length wrapped around before pos
+			// try to read up to the byte before bufferPos to not trigger the
+			// bufferPos == bufferLength case
+			length = receiveSocket(buffer[bufferLength .. bufferPos - 1]);
+		} else {
+			length = receiveSocket(buffer[bufferLength .. $]);
+		}
+
+		bufferLength += length;
+		if (bufferLength == buffer.length)
+			bufferLength = 0;
+	}
+
+	void readExact(scope ubyte[] dst) {
+		if (!dst.length)
+			return;
+
+		if (bufferPos == bufferLength)
 			loadMore();
 
-			goto got_more;
+		auto end = bufferPos + dst.length;
+		if (end < buffer.length) {
+			// easy linear copy
+			// receive until bufferLength wrapped around or we have enough bytes
+			while (bufferLength >= bufferPos && end > bufferLength)
+				loadMore();
+			dst[] = buffer[bufferPos .. bufferPos = cast(typeof(bufferPos))end];
+		} else {
+			// copy from wrapping buffer
+			size_t i;
+			while (i < dst.length) {
+				auto remaining = dst.length - i;
+				if (bufferPos < bufferLength) {
+					auto d = min(remaining, bufferLength - bufferPos);
+					dst[i .. i += d] = buffer[bufferPos .. bufferPos += d];
+				} else if (bufferPos > bufferLength) {
+					auto d = buffer.length - bufferPos;
+					if (remaining >= d) {
+						dst[i .. i += d] = buffer[bufferPos .. $];
+						dst[i .. i += bufferLength] = buffer[0 .. bufferPos = bufferLength];
+					} else {
+						dst[i .. i += remaining] = buffer[bufferPos .. bufferPos += remaining];
+					}
+				} else {
+					loadMore();
+				}
+			}
 		}
 	}
 
+	immutable(ubyte)[] readUntilNull() {
+		auto ret = appender!(immutable(ubyte)[]);
+		while (true) {
+			ubyte[] chunk;
+			if (bufferPos < bufferLength) {
+				chunk = buffer[bufferPos .. bufferLength];
+			} else if (bufferPos > bufferLength) {
+				chunk = buffer[bufferPos .. $];
+			} else {
+				loadMore();
+				continue;
+			}
+
+			auto zero = chunk.countUntil(0);
+			if (zero == -1) {
+				ret ~= chunk;
+				bufferPos += chunk.length;
+				if (bufferPos == buffer.length)
+					bufferPos = 0;
+			} else {
+				ret ~= chunk[0 .. zero];
+				bufferPos += zero + 1;
+				return ret.data;
+			}
+		}
+	}
+}
+
+unittest {
+	class MockedSocketReceiveStream : SocketReceiveStream {
+		int maxChunk = 64;
+		ubyte generator = 0;
+
+		this() {
+			super(null);
+		}
+
+		protected override ptrdiff_t receiveSocket(ubyte[] buffer) {
+			if (buffer.length >= maxChunk) {
+				buffer[0 .. maxChunk] = ++generator;
+				return maxChunk;
+			} else {
+				buffer[] = ++generator;
+				return buffer.length;
+			}
+		}
+	}
+
+	auto stream = new MockedSocketReceiveStream();
+	stream.buffer[] = 0;
+	auto b = stream.readBytes(3);
+	assert(b == [1, 1, 1]);
+	assert(stream.buffer[0 .. 64].all!(a => a == 1));
+	assert(stream.buffer[64 .. $].all!(a => a == 0));
+	b = stream.readBytes(3);
+	assert(b == [1, 1, 1]);
+	assert(stream.buffer[64 .. $].all!(a => a == 0));
+	assert(stream.bufferPos == 6);
+	assert(stream.bufferLength == 64);
+	b = stream.readBytes(64);
+	assert(b[0 .. $ - 6].all!(a => a == 1));
+	assert(b[$ - 6 .. $].all!(a => a == 2));
+	assert(stream.bufferPos == 70);
+	assert(stream.bufferLength == 128);
+	b = stream.readBytes(57);
+	assert(b.all!(a => a == 2));
+	assert(stream.bufferPos == 127);
+	assert(stream.bufferLength == 128);
+	b = stream.readBytes(8000);
+	assert(b[0] == 2);
+	assert(b[1 .. 65].all!(a => a == 3));
+	assert(b[65 .. 129].all!(a => a == 4));
+
+	stream.buffer[] = 0;
+	stream.bufferPos = stream.bufferLength = 0;
+	stream.generator = 0;
+	assert(stream.readUntilNull().length == 64 * 255);
 }
 
 struct SendBuffer {
