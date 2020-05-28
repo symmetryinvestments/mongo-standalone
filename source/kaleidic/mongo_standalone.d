@@ -2,6 +2,9 @@ module kaleidic.mongo_standalone;
 
 import std.socket;
 
+static immutable string mongoDriverName = "mongo-standalone";
+static immutable string mongoDriverVersion = "0.0.3";
+
 // just a demo of how it can be used
 version(none)
 void main() {
@@ -40,6 +43,28 @@ enum QueryFlags {
 	Partial = (1 << 7)
 }
 
+/// Server Wire version indicating supported features
+/// $(LINK https://github.com/mongodb/specifications/blob/master/source/wireversion-featurelist.rst)
+enum WireVersion {
+	/// Pre 2.6 (-2.4)
+	old = 0,
+	/// Server version 2.6
+	v26 = 1,
+	/// Server version 2.6
+	v26_2 = 2,
+	/// Server version 3.0
+	v30 = 3,
+	/// Server version 3.2
+	v32 = 4,
+	/// Server version 3.4
+	v34 = 5,
+	/// Server version 3.6
+	v36 = 6,
+	/// Server version 4.0
+	v40 = 7,
+	/// Server version 4.2
+	v42 = 8,
+}
 
 class MongoConnection {
 
@@ -48,7 +73,77 @@ class MongoConnection {
 
 	uint defaultQueryFlags;
 
-	void authenticate(string authDatabase, string username, string password) {
+	/// Reported minimum wire version by the server
+	WireVersion minWireVersion;
+	/// Reported maximum wire version by the server
+	WireVersion maxWireVersion;
+
+	private document handshake(string authDatabase, string username,
+			document application) {
+		import std.compiler : compilerName = name, version_major, version_minor;
+		import std.conv : text, to;
+		import std.system : os;
+
+		auto dbcmd = authDatabase ~ ".$cmd";
+
+		static immutable osType = os.to!string;
+
+		version (X86_64)
+			static immutable osArchitecture = "x86_64";
+		else version (X86)
+			static immutable osArchitecture = "x86";
+		else version (ARM)
+			static immutable osArchitecture = "arm";
+		else version (PPC64)
+			static immutable osArchitecture = "ppc64";
+		else version (PPC)
+			static immutable osArchitecture = "ppc";
+		else
+			static assert(false, "no name for this architecture");
+
+		static immutable platform = text(compilerName, " v", version_major, ".", version_minor);
+
+		bson_value[] client;
+		if (application.length)
+		{
+			auto name = application["name"];
+			if (name == bson_value.init)
+				throw new Exception("Given application without name");
+			// https://github.com/mongodb/specifications/blob/master/source/mongodb-handshake/handshake.rst#limitations
+			if (name.toString().length > 128)
+				throw new Exception("Application name must not exceed 128 bytes");
+
+			client ~= bson_value("application", application);
+		}
+
+		client ~= [
+			bson_value("driver", document([
+				bson_value("name", mongoDriverName),
+				bson_value("version", mongoDriverVersion)
+			])),
+			bson_value("os", document([
+				bson_value("type", osType),
+				bson_value("architecture", osArchitecture)
+			])),
+			bson_value("platform", platform)
+		];
+
+		auto cmd = [
+			bson_value("isMaster", 1),
+			bson_value("client", document(client))
+		];
+		if (username.length)
+			cmd ~= bson_value("saslSupportedMechs", authDatabase ~ "." ~ username);
+
+		auto reply = query(dbcmd, 0, -1, document(cmd));
+		if (reply.documents.length != 1 || reply.documents[0]["ok"].get!double != 1)
+			throw new Exception("MongoDB Handshake failed");
+
+		return reply.documents[0];
+	}
+
+	private void authenticateScramSha1(string authDatabase, string username,
+			string password) {
 		auto dbcmd = authDatabase ~ ".$cmd";
 
 		bson_value conversationId;
@@ -60,10 +155,12 @@ class MongoConnection {
 		auto cmd = document([
 			bson_value("saslStart", 1),
 			bson_value("mechanism", "SCRAM-SHA-1"),
-			bson_value("payload", payload)
+			bson_value("payload", payload),
+			bson_value("options", document([
+				bson_value("skipEmptyExchange", true)
+			]))
 		]);
 
-		//import std.stdio; writeln(dbcmd, " ", firstReply);
 
 		auto firstReply = query(dbcmd, 0, -1, cmd);
 		if(firstReply.documents.length != 1 || firstReply.documents[0]["ok"].get!double != 1)
@@ -94,6 +191,10 @@ class MongoConnection {
 
 		payload = cast(typeof(payload)) state.finalize(cast(string) response2);
 
+		// newer servers can save a roundtrip (they know the password here already)
+		if(secondReply.documents[0]["done"].get!bool)
+			return;
+
 		cmd = document([
 			bson_value("saslContinue", 1),
 			bson_value("conversationId", conversationId),
@@ -106,6 +207,9 @@ class MongoConnection {
 
 		if(finalReply.documents[0]["ok"].get!double != 1)
 			throw new Exception("Auth failed at final step");
+
+		if(!finalReply.documents[0]["done"].get!bool)
+			throw new Exception("Authentication didn't respond 'done'");
 	}
 
 	this(string connectionString) {
@@ -123,6 +227,8 @@ class MongoConnection {
 		string username;
 		string password;
 		string authDb = "admin";
+		string appName;
+
 		auto split = uri.userinfo.indexOf(":");
 		if(split != -1) {
 			username = decode(uri.userinfo[0 .. split]);
@@ -136,8 +242,10 @@ class MongoConnection {
 			auto name = decode(part[0 .. split]);
 			auto value = decode(part[split + 1 .. $]);
 
+			// https://docs.mongodb.com/manual/reference/connection-string/#connections-connection-options
 			switch(name) {
 				case "slaveOk": defaultQueryFlags |= QueryFlags.SlaveOk; break;
+				case "appName": appName = value; break;
 				default: throw new Exception("Unsupported mongo db connect option: " ~ name);
 			}
 		}
@@ -153,8 +261,53 @@ class MongoConnection {
 
 		stream = new ReceiveStream(socket);
 
-		if(username.length) {
-			authenticate(authDb, username, password);
+		document appArgs;
+		if (appName.length)
+			appArgs = document([bson_value("name", appName)]);
+		auto handshakeResponse = handshake(authDb, username, appArgs);
+
+		minWireVersion = cast(WireVersion)handshakeResponse["minWireVersion"].get!int;
+		maxWireVersion = cast(WireVersion)handshakeResponse["maxWireVersion"].get!int;
+
+		bool supportsScramSha1 = maxWireVersion >= WireVersion.v30;
+		bool supportsScramSha256 = maxWireVersion >= WireVersion.v40;
+
+		auto saslSupportedMechs = handshakeResponse["saslSupportedMechs"];
+		if (saslSupportedMechs != bson_value.init) {
+			auto arr = saslSupportedMechs.get!(const(bson_value)[]);
+			supportsScramSha1 = false;
+			supportsScramSha256 = false;
+			foreach (v; arr) {
+				switch (v.toString) {
+				case "SCRAM-SHA-1":
+					supportsScramSha1 = true;
+					break;
+				case "SCRAM-SHA-256":
+					supportsScramSha256 = true;
+					break;
+				default:
+					// unsupported mechanism
+					break;
+				}
+			}
+		}
+
+		// https://github.com/mongodb/specifications/blob/master/source/auth/auth.rst#supported-authentication-methods
+		if (username.length) {
+			// TODO: support other (certificate based) authentication mechanisms
+
+			// TODO: SCRAM-SHA-256 support
+			// if (supportsScramSha256) {
+			// } else
+			if (supportsScramSha1) {
+				authenticateScramSha1(authDb, username, password);
+			} else {
+				if (maxWireVersion < WireVersion.v30)
+					throw new Exception("legacy MONGODB-CR authentication not implemented");
+				else
+					throw new Exception(
+						"Cannot authenticate because no common authentication mechanism could be found.");
+			}
 		}
 	}
 
@@ -808,6 +961,10 @@ struct document {
 			bytesCount += v.size;
 	}
 
+	size_t length() const {
+		return values_.length;
+	}
+
 	const(bson_value)[] values() const {
 		return values_;
 	}
@@ -883,33 +1040,43 @@ struct Decimal128 {
 struct Undefined {}
 
 
-struct toStringVisitor {
+struct ToStringVisitor(T) if (isSomeString!T) {
 	import std.conv;
 
 	// of course this could have been a template but I wrote it out long-form for copy/paste purposes
-	string visit(const double v) { return to!string(v); }
-	string visit(const string v) { return to!string(v); }
-	string visit(const document v) { return to!string(v); }
-	string visit(const const(bson_value)[] v) { return to!string(v); }
-	string visit(const ubyte tag, const ubyte[] v) { return to!string(v); }
-	string visit(const ObjectId v) { return to!string(v); }
-	string visit(const bool v) { return to!string(v); }
-	string visit(const UtcTimestamp v) { return to!string(v); }
-	string visit(const typeof(null)) { return "null"; }
-	string visit(const RegEx v) { return to!string(v); }
-	string visit(const Javascript v) { return to!string(v); }
-	string visit(const int v) { return to!string(v); }
-	string visit(const Undefined) { return "undefined"; }
-	string visit(const Timestamp v) { return to!string(v); }
-	string visit(const long v) { return to!string(v); }
-	string visit(const Decimal128 v) { return to!string(v); }
+	T visit(const double v) { return to!T(v); }
+	T visit(const string v) { return to!T(v); }
+	T visit(const document v) { return to!T(v); }
+	T visit(const const(bson_value)[] v) { return to!T(v); }
+	T visit(const ubyte tag, const ubyte[] v) { return to!T(v); }
+	T visit(const ObjectId v) { return to!T(v); }
+	T visit(const bool v) { return to!T(v); }
+	T visit(const UtcTimestamp v) { return to!T(v); }
+	T visit(const typeof(null)) { return to!T(null); }
+	T visit(const RegEx v) { return to!T(v); }
+	T visit(const Javascript v) { return to!T(v); }
+	T visit(const int v) { return to!T(v); }
+	T visit(const Undefined) { return "undefined".to!T; }
+	T visit(const Timestamp v) { return to!T(v); }
+	T visit(const long v) { return to!T(v); }
+	T visit(const Decimal128 v) { return to!T(v); }
 }
 
-struct get_visitor(T) {
+struct GetVisitor(T) {
 	T visit(V)(const V t) {
-		static if(is(V : T))
-			return t;
-		else throw new Exception("incompatible type");
+		static if (isIntegral!V) {
+			static if(isIntegral!T || isFloatingPoint!T)
+				return cast(T)t;
+			else throw new Exception("incompatible type");
+		} else static if (isFloatingPoint!V) {
+			static if(isFloatingPoint!T)
+				return cast(T)t;
+			else throw new Exception("incompatible type");
+		} else {
+			static if(is(V : T))
+				return t;
+			else throw new Exception("incompatible type");
+		}
 	}
 
 	T visit(ubyte tag, const(ubyte)[] v) {
@@ -924,8 +1091,11 @@ struct bson_value {
 	private const(char)[] e_name;
 
 	// It only allows integer types or const getting in order to work right in the visitor...
-	T get(T)() const if(is(T : double) || is(T == const)) {
-		get_visitor!T v;
+	/// Tries to get the value matching exactly this type. The type will convert
+	/// between different floating point types and integral types as well as
+	/// perform a conversion from integral types to floating point types.
+	T get(T)() const if (__traits(compiles, GetVisitor!T)) {
+		GetVisitor!T v;
 		return visit(v);
 	}
 
@@ -1047,8 +1217,8 @@ struct bson_value {
 	}
 
 	string toString() const {
-		toStringVisitor v;
-		return visit!toStringVisitor(v);
+		ToStringVisitor!string v;
+		return visit(v);
 	}
 
 	private union {
