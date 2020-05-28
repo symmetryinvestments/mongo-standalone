@@ -155,10 +155,12 @@ class MongoConnection {
 		auto cmd = document([
 			bson_value("saslStart", 1),
 			bson_value("mechanism", "SCRAM-SHA-1"),
-			bson_value("payload", payload)
+			bson_value("payload", payload),
+			bson_value("options", document([
+				bson_value("skipEmptyExchange", true)
+			]))
 		]);
 
-		//import std.stdio; writeln(dbcmd, " ", firstReply);
 
 		auto firstReply = query(dbcmd, 0, -1, cmd);
 		if(firstReply.documents.length != 1 || firstReply.documents[0]["ok"].get!double != 1)
@@ -189,6 +191,10 @@ class MongoConnection {
 
 		payload = cast(typeof(payload)) state.finalize(cast(string) response2);
 
+		// newer servers can save a roundtrip (they know the password here already)
+		if(secondReply.documents[0]["done"].get!bool)
+			return;
+
 		cmd = document([
 			bson_value("saslContinue", 1),
 			bson_value("conversationId", conversationId),
@@ -201,6 +207,9 @@ class MongoConnection {
 
 		if(finalReply.documents[0]["ok"].get!double != 1)
 			throw new Exception("Auth failed at final step");
+
+		if(!finalReply.documents[0]["done"].get!bool)
+			throw new Exception("Authentication didn't respond 'done'");
 	}
 
 	this(string connectionString) {
