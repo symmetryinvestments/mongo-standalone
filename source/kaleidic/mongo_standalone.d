@@ -461,7 +461,9 @@ class ReceiveStream {
 			bufferLength = 0;
 		}
 		auto ret = socket.receive(buffer[bufferLength .. $]);
-		if(ret <= 0)
+		if (ret == 0)
+			throw new Exception("Remote side has closed the connection");
+		else if (ret == Socket.ERROR)
 			throw new Exception(lastSocketError());
 		bufferLength += ret;
 	}
