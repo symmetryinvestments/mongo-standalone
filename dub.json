@@ -6,5 +6,5 @@
 	],
 	"description": "A standalone (no dependencies outside the stdlib) Mongo database driver for D.",
 	"copyright": "Copyright © 2020, Symmetry Investments",
-	"license": "Boost"
+	"license": "BSL-1.0"
 }
