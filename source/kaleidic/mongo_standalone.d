@@ -907,11 +907,21 @@ struct ToStringVisitor(T) if (isSomeString!T) {
 	T visit(const Decimal128 v) { return to!T(v); }
 }
 
-struct get_visitor(T) {
+struct GetVisitor(T) {
 	T visit(V)(const V t) {
+		static if (isIntegral!V) {
+			static if(isIntegral!T || isFloatingPoint!T)
+				return cast(T)t;
+			else throw new Exception("incompatible type");
+		} else static if (isFloatingPoint!V) {
+			static if(isFloatingPoint!T)
+				return cast(T)t;
+			else throw new Exception("incompatible type");
+		} else {
 		static if(is(V : T))
 			return t;
 		else throw new Exception("incompatible type");
+	}
 	}
 
 	T visit(ubyte tag, const(ubyte)[] v) {
@@ -926,8 +936,11 @@ struct bson_value {
 	private const(char)[] e_name;
 
 	// It only allows integer types or const getting in order to work right in the visitor...
-	T get(T)() const if(is(T : double) || is(T == const)) {
-		get_visitor!T v;
+	/// Tries to get the value matching exactly this type. The type will convert
+	/// between different floating point types and integral types as well as
+	/// perform a conversion from integral types to floating point types.
+	T get(T)() const if (__traits(compiles, GetVisitor!T)) {
+		GetVisitor!T v;
 		return visit(v);
 	}
 
