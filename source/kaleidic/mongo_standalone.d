@@ -2,6 +2,9 @@ module kaleidic.mongo_standalone;
 
 import std.socket;
 
+static immutable string mongoDriverName = "mongo-standalone";
+static immutable string mongoDriverVersion = "0.0.3";
+
 // just a demo of how it can be used
 version(none)
 void main() {
@@ -40,6 +43,28 @@ enum QueryFlags {
 	Partial = (1 << 7)
 }
 
+/// Server Wire version indicating supported features
+/// $(LINK https://github.com/mongodb/specifications/blob/master/source/wireversion-featurelist.rst)
+enum WireVersion {
+	/// Pre 2.6 (-2.4)
+	old = 0,
+	/// Server version 2.6
+	v26 = 1,
+	/// Server version 2.6
+	v26_2 = 2,
+	/// Server version 3.0
+	v30 = 3,
+	/// Server version 3.2
+	v32 = 4,
+	/// Server version 3.4
+	v34 = 5,
+	/// Server version 3.6
+	v36 = 6,
+	/// Server version 4.0
+	v40 = 7,
+	/// Server version 4.2
+	v42 = 8,
+}
 
 class MongoConnection {
 
@@ -48,7 +73,77 @@ class MongoConnection {
 
 	uint defaultQueryFlags;
 
-	void authenticate(string authDatabase, string username, string password) {
+	/// Reported minimum wire version by the server
+	WireVersion minWireVersion;
+	/// Reported maximum wire version by the server
+	WireVersion maxWireVersion;
+
+	private document handshake(string authDatabase, string username,
+			document application) {
+		import std.compiler : compilerName = name, version_major, version_minor;
+		import std.conv : text, to;
+		import std.system : os;
+
+		auto dbcmd = authDatabase ~ ".$cmd";
+
+		static immutable osType = os.to!string;
+
+		version (X86_64)
+			static immutable osArchitecture = "x86_64";
+		else version (X86)
+			static immutable osArchitecture = "x86";
+		else version (ARM)
+			static immutable osArchitecture = "arm";
+		else version (PPC64)
+			static immutable osArchitecture = "ppc64";
+		else version (PPC)
+			static immutable osArchitecture = "ppc";
+		else
+			static assert(false, "no name for this architecture");
+
+		static immutable platform = text(compilerName, " v", version_major, ".", version_minor);
+
+		bson_value[] client;
+		if (application.length)
+		{
+			auto name = application["name"];
+			if (name == bson_value.init)
+				throw new Exception("Given application without name");
+			// https://github.com/mongodb/specifications/blob/master/source/mongodb-handshake/handshake.rst#limitations
+			if (name.toString().length > 128)
+				throw new Exception("Application name must not exceed 128 bytes");
+
+			client ~= bson_value("application", application);
+		}
+
+		client ~= [
+			bson_value("driver", document([
+				bson_value("name", mongoDriverName),
+				bson_value("version", mongoDriverVersion)
+			])),
+			bson_value("os", document([
+				bson_value("type", osType),
+				bson_value("architecture", osArchitecture)
+			])),
+			bson_value("platform", platform)
+		];
+
+		auto cmd = [
+			bson_value("isMaster", 1),
+			bson_value("client", document(client))
+		];
+		if (username.length)
+			cmd ~= bson_value("saslSupportedMechs", authDatabase ~ "." ~ username);
+
+		auto reply = query(dbcmd, 0, -1, document(cmd));
+		if (reply.documents.length != 1 || reply.documents[0]["ok"].get!double != 1)
+			throw new Exception("MongoDB Handshake failed");
+
+		return reply.documents[0];
+	}
+
+	private void authenticateScramSha1(string authDatabase, string username,
+			string password) {
 		auto dbcmd = authDatabase ~ ".$cmd";
 
 		bson_value conversationId;
@@ -123,6 +218,8 @@ class MongoConnection {
 		string username;
 		string password;
 		string authDb = "admin";
+		string appName;
+
 		auto split = uri.userinfo.indexOf(":");
 		if(split != -1) {
 			username = decode(uri.userinfo[0 .. split]);
@@ -136,8 +233,10 @@ class MongoConnection {
 			auto name = decode(part[0 .. split]);
 			auto value = decode(part[split + 1 .. $]);
 
+			// https://docs.mongodb.com/manual/reference/connection-string/#connections-connection-options
 			switch(name) {
 				case "slaveOk": defaultQueryFlags |= QueryFlags.SlaveOk; break;
+				case "appName": appName = value; break;
 				default: throw new Exception("Unsupported mongo db connect option: " ~ name);
 			}
 		}
@@ -153,8 +252,53 @@ class MongoConnection {
 
 		stream = new ReceiveStream(socket);
 
-		if(username.length) {
-			authenticate(authDb, username, password);
+		document appArgs;
+		if (appName.length)
+			appArgs = document([bson_value("name", appName)]);
+		auto handshakeResponse = handshake(authDb, username, appArgs);
+
+		minWireVersion = cast(WireVersion)handshakeResponse["minWireVersion"].get!int;
+		maxWireVersion = cast(WireVersion)handshakeResponse["maxWireVersion"].get!int;
+
+		bool supportsScramSha1 = maxWireVersion >= WireVersion.v30;
+		bool supportsScramSha256 = maxWireVersion >= WireVersion.v40;
+
+		auto saslSupportedMechs = handshakeResponse["saslSupportedMechs"];
+		if (saslSupportedMechs != bson_value.init) {
+			auto arr = saslSupportedMechs.get!(const(bson_value)[]);
+			supportsScramSha1 = false;
+			supportsScramSha256 = false;
+			foreach (v; arr) {
+				switch (v.toString) {
+				case "SCRAM-SHA-1":
+					supportsScramSha1 = true;
+					break;
+				case "SCRAM-SHA-256":
+					supportsScramSha256 = true;
+					break;
+				default:
+					// unsupported mechanism
+					break;
+				}
+			}
+		}
+
+		// https://github.com/mongodb/specifications/blob/master/source/auth/auth.rst#supported-authentication-methods
+		if (username.length) {
+			// TODO: support other (certificate based) authentication mechanisms
+
+			// TODO: SCRAM-SHA-256 support
+			// if (supportsScramSha256) {
+			// } else
+			if (supportsScramSha1) {
+				authenticateScramSha1(authDb, username, password);
+			} else {
+				if (maxWireVersion < WireVersion.v30)
+					throw new Exception("legacy MONGODB-CR authentication not implemented");
+				else
+					throw new Exception(
+						"Cannot authenticate because no common authentication mechanism could be found.");
+			}
 		}
 	}
 
@@ -918,10 +1062,10 @@ struct GetVisitor(T) {
 				return cast(T)t;
 			else throw new Exception("incompatible type");
 		} else {
-		static if(is(V : T))
-			return t;
-		else throw new Exception("incompatible type");
-	}
+			static if(is(V : T))
+				return t;
+			else throw new Exception("incompatible type");
+		}
 	}
 
 	T visit(ubyte tag, const(ubyte)[] v) {
