@@ -6,7 +6,12 @@
 +/
 module kaleidic.mongo_standalone;
 
+import std.array;
+import std.bitmanip;
 import std.socket;
+
+static immutable string mongoDriverName = "mongo-standalone";
+static immutable string mongoDriverVersion = "0.0.3";
 
 // just a demo of how it can be used
 version(none)
@@ -46,15 +51,107 @@ enum QueryFlags {
 	Partial = (1 << 7)
 }
 
+/// Server Wire version indicating supported features
+/// $(LINK https://github.com/mongodb/specifications/blob/master/source/wireversion-featurelist.rst)
+enum WireVersion {
+	/// Pre 2.6 (-2.4)
+	old = 0,
+	/// Server version 2.6
+	v26 = 1,
+	/// Server version 2.6
+	v26_2 = 2,
+	/// Server version 3.0
+	v30 = 3,
+	/// Server version 3.2
+	v32 = 4,
+	/// Server version 3.4
+	v34 = 5,
+	/// Server version 3.6
+	v36 = 6,
+	/// Server version 4.0
+	v40 = 7,
+	/// Server version 4.2
+	v42 = 8,
+}
 
 class MongoConnection {
 
 	Socket socket;
-	ReceiveStream stream;
+	IReceiveStream stream;
 
 	uint defaultQueryFlags;
 
-	void authenticate(string authDatabase, string username, string password) {
+	/// Reported minimum wire version by the server
+	WireVersion minWireVersion;
+	/// Reported maximum wire version by the server
+	WireVersion maxWireVersion;
+
+	private document handshake(string authDatabase, string username,
+			document application) {
+		import std.compiler : compilerName = name, version_major, version_minor;
+		import std.conv : text, to;
+		import std.system : os;
+
+		auto dbcmd = authDatabase ~ ".$cmd";
+
+		static immutable osType = os.to!string;
+
+		version (X86_64)
+			static immutable osArchitecture = "x86_64";
+		else version (X86)
+			static immutable osArchitecture = "x86";
+		else version (ARM)
+			static immutable osArchitecture = "arm";
+		else version (PPC64)
+			static immutable osArchitecture = "ppc64";
+		else version (PPC)
+			static immutable osArchitecture = "ppc";
+		else
+			static assert(false, "no name for this architecture");
+
+		static immutable platform = text(compilerName, " v", version_major, ".", version_minor);
+
+		bson_value[] client;
+		if (application.length)
+		{
+			auto name = application["name"];
+			if (name == bson_value.init)
+				throw new Exception("Given application without name");
+			// https://github.com/mongodb/specifications/blob/master/source/mongodb-handshake/handshake.rst#limitations
+			if (name.toString().length > 128)
+				throw new Exception("Application name must not exceed 128 bytes");
+
+			client ~= bson_value("application", application);
+		}
+
+		client ~= [
+			bson_value("driver", document([
+				bson_value("name", mongoDriverName),
+				bson_value("version", mongoDriverVersion)
+			])),
+			bson_value("os", document([
+				bson_value("type", osType),
+				bson_value("architecture", osArchitecture)
+			])),
+			bson_value("platform", platform)
+		];
+
+		auto cmd = [
+			bson_value("isMaster", 1),
+			bson_value("client", document(client))
+		];
+		if (username.length)
+			cmd ~= bson_value("saslSupportedMechs", authDatabase ~ "." ~ username);
+
+		auto reply = query(dbcmd, 0, -1, document(cmd));
+		if (reply.documents.length != 1 || reply.documents[0]["ok"].get!double != 1)
+			throw new Exception("MongoDB Handshake failed");
+
+		return reply.documents[0];
+	}
+
+	private void authenticateScramSha1(string authDatabase, string username,
+			string password) {
 		auto dbcmd = authDatabase ~ ".$cmd";
 
 		bson_value conversationId;
@@ -66,10 +163,12 @@ class MongoConnection {
 		auto cmd = document([
 			bson_value("saslStart", 1),
 			bson_value("mechanism", "SCRAM-SHA-1"),
-			bson_value("payload", payload)
+			bson_value("payload", payload),
+			bson_value("options", document([
+				bson_value("skipEmptyExchange", true)
+			]))
 		]);
 
-		//import std.stdio; writeln(dbcmd, " ", firstReply);
 
 		auto firstReply = query(dbcmd, 0, -1, cmd);
 		if(firstReply.documents.length != 1 || firstReply.documents[0]["ok"].get!double != 1)
@@ -100,6 +199,10 @@ class MongoConnection {
 
 		payload = cast(typeof(payload)) state.finalize(cast(string) response2);
 
+		// newer servers can save a roundtrip (they know the password here already)
+		if(secondReply.documents[0]["done"].get!bool)
+			return;
+
 		cmd = document([
 			bson_value("saslContinue", 1),
 			bson_value("conversationId", conversationId),
@@ -112,6 +215,9 @@ class MongoConnection {
 
 		if(finalReply.documents[0]["ok"].get!double != 1)
 			throw new Exception("Auth failed at final step");
+
+		if(!finalReply.documents[0]["done"].get!bool)
+			throw new Exception("Authentication didn't respond 'done'");
 	}
 
 	this(string connectionString) {
@@ -129,6 +235,8 @@ class MongoConnection {
 		string username;
 		string password;
 		string authDb = "admin";
+		string appName;
+
 		auto split = uri.userinfo.indexOf(":");
 		if(split != -1) {
 			username = decode(uri.userinfo[0 .. split]);
@@ -142,8 +250,10 @@ class MongoConnection {
 			auto name = decode(part[0 .. split]);
 			auto value = decode(part[split + 1 .. $]);
 
+			// https://docs.mongodb.com/manual/reference/connection-string/#connections-connection-options
 			switch(name) {
 				case "slaveOk": defaultQueryFlags |= QueryFlags.SlaveOk; break;
+				case "appName": appName = value; break;
 				default: throw new Exception("Unsupported mongo db connect option: " ~ name);
 			}
 		}
@@ -157,10 +267,55 @@ class MongoConnection {
 			socket = new TcpSocket(new InternetAddress(host, cast(ushort) uri.port));
 		}
 
-		stream = new ReceiveStream(socket);
+		stream = new SocketReceiveStream(socket);
 
-		if(username.length) {
-			authenticate(authDb, username, password);
+		document appArgs;
+		if (appName.length)
+			appArgs = document([bson_value("name", appName)]);
+		auto handshakeResponse = handshake(authDb, username, appArgs);
+
+		minWireVersion = cast(WireVersion)handshakeResponse["minWireVersion"].get!int;
+		maxWireVersion = cast(WireVersion)handshakeResponse["maxWireVersion"].get!int;
+
+		bool supportsScramSha1 = maxWireVersion >= WireVersion.v30;
+		bool supportsScramSha256 = maxWireVersion >= WireVersion.v40;
+
+		auto saslSupportedMechs = handshakeResponse["saslSupportedMechs"];
+		if (saslSupportedMechs != bson_value.init) {
+			auto arr = saslSupportedMechs.get!(const(bson_value)[]);
+			supportsScramSha1 = false;
+			supportsScramSha256 = false;
+			foreach (v; arr) {
+				switch (v.toString) {
+				case "SCRAM-SHA-1":
+					supportsScramSha1 = true;
+					break;
+				case "SCRAM-SHA-256":
+					supportsScramSha256 = true;
+					break;
+				default:
+					// unsupported mechanism
+					break;
+				}
+			}
+		}
+
+		// https://github.com/mongodb/specifications/blob/master/source/auth/auth.rst#supported-authentication-methods
+		if (username.length) {
+			// TODO: support other (certificate based) authentication mechanisms
+
+			// TODO: SCRAM-SHA-256 support
+			// if (supportsScramSha256) {
+			// } else
+			if (supportsScramSha1) {
+				authenticateScramSha1(authDb, username, password);
+			} else {
+				if (maxWireVersion < WireVersion.v30)
+					throw new Exception("legacy MONGODB-CR authentication not implemented");
+				else
+					throw new Exception(
+						"Cannot authenticate because no common authentication mechanism could be found.");
+			}
 		}
 	}
 
@@ -316,13 +471,8 @@ class MongoConnection {
 	}
 }
 
-class ReceiveStream {
-	this(Socket socket) {
-		this.socket = socket;
-	}
-
-
-	OP_REPLY readReply() {
+interface IReceiveStream {
+	final OP_REPLY readReply() {
 		OP_REPLY reply;
 
 		reply.header.messageLength = readInt();
@@ -345,7 +495,7 @@ class ReceiveStream {
 		return reply;
 	}
 
-	document readBson() {
+	final document readBson() {
 		document d;
 		d.bytesCount = readInt();
 
@@ -364,7 +514,7 @@ class ReceiveStream {
 		return d;
 	}
 
-	bson_value readBsonValue(ref int remaining) {
+	final bson_value readBsonValue(ref int remaining) {
 		bson_value v;
 
 		v.tag = readByte();
@@ -455,107 +605,222 @@ class ReceiveStream {
 		return v;
 	}
 
+	final ubyte readByte() {
+		return readSmall!1[0];
+	}
+
+	final int readInt() {
+		return readSmall!4.littleEndianToNative!int;
+	}
+
+	final long readLong() {
+		return readSmall!8.littleEndianToNative!long;
+	}
+
+	final double readDouble() {
+		return readSmall!8.littleEndianToNative!double;
+	}
+	
+	final string readZeroTerminatedChars() {
+		return cast(string) readUntilNull();
+	}
+
+	final string readCharsWithLengthPrefix() {
+		auto length = readInt();
+		// length prefixed string allows 0 characters
+		auto bytes = readBytes(length);
+		if (bytes[$ - 1] != 0)
+			throw new Exception("Malformed length prefixed string");
+		return cast(string)bytes[0 .. $ - 1];
+	}
+
+	/// Reads exactly the amount of bytes specified and returns a newly
+	/// allocated buffer containing the data.
+	final immutable(ubyte)[] readBytes(size_t length) {
+		ubyte[] ret = new ubyte[length];
+		readExact(ret);
+		return (() @trusted => cast(immutable)ret)();
+	}
+
+	/// Reads a small number of bytes into a stack allocated array. Convenience
+	/// function calling $(LREF readExact).
+	ubyte[n] readSmall(size_t n)() {
+		ubyte[n] buf;
+		readExact(buf[]);
+		return buf;
+	}
+
+	/// Reads exactly the expected length into the given buffer argument.
+	void readExact(scope ubyte[] buffer);
+
+	/// Reads until a 0 byte and returns all data before it as newly allocated
+	/// buffer containing the data.
+	immutable(ubyte)[] readUntilNull();
+}
+
+class SocketReceiveStream : IReceiveStream {
+	this(Socket socket) {
+		this.socket = socket;
+	}
 
 	Socket socket;
 	ubyte[4096] buffer;
-	size_t bufferLength;
+	// if bufferLength > bufferPos then following data is linear after bufferPos
+	// if bufferLength < bufferPos then data is following bufferPos and also from 0..bufferLength
+	// if bufferLength == bufferPos then all data is read
+	int bufferLength;
+	// may only increment until at the end of buffer.length, where it wraps back to 0
 	int bufferPos;
 
-	void loadMore() {
-		if(bufferPos == bufferLength) {
-			bufferPos = 0;
-			bufferLength = 0;
-		}
-		auto ret = socket.receive(buffer[bufferLength .. $]);
-		if(ret <= 0)
+	protected ptrdiff_t receiveSocket(ubyte[] buffer) {
+		const length = socket.receive(buffer);
+
+		if (length == 0)
+			throw new Exception("Remote side has closed the connection");
+		else if (length == Socket.ERROR)
 			throw new Exception(lastSocketError());
-		bufferLength += ret;
-	}
-	void loadAtLeast(int needed) {
-		while(bufferLength - bufferPos < needed)
-			loadMore();
+		else
+			return length;
 	}
 
-	ubyte readByte() {
-		loadAtLeast(1);
-		return buffer[bufferPos++];
-	}
-
-	int readInt() {
-		loadAtLeast(4);
-		uint a;
-		int shift;
-		foreach(i; 0 .. 4) {
-			a |= (cast(uint) buffer[bufferPos++]) << shift;
-			shift += 8;
-		}
-		return a;
-	}
-
-	long readLong() {
-		loadAtLeast(8);
-		ulong a;
-		int shift;
-		foreach(i; 0 .. 8) {
-			a |= (cast(ulong) buffer[bufferPos++]) << shift;
-			shift += 8;
-		}
-		return a;
-	}
-
-	double readDouble() {
-		auto a = readLong();
-		return *(cast(double*) &a);
-	}
-
-	string readZeroTerminatedChars() {
-		string ret;
-
-		got_more:
-		auto start = bufferPos;
-		while(bufferPos < bufferLength) {
-			if(buffer[bufferPos] == 0) {
-				ret ~= cast(char[]) buffer[start .. bufferPos];
-				bufferPos++; // skip the zero term
-				return ret;
-			}
-			bufferPos++;
-		}
-
-		ret ~= cast(char[]) buffer[bufferPos .. bufferLength];
-		bufferPos = 0;
-		bufferLength = 0;
-		loadMore();
-		goto got_more;
-	}
-
-	string readCharsWithLengthPrefix() {
-		auto length = readInt();
-		auto got = readZeroTerminatedChars();
-		if(got.length + 1 != length)
-			throw new Exception("length mismatch, wtf");
-		return got;
-	}
-
-	ubyte[] readBytes(int length) {
-		ubyte[] ret;
-
-		got_more:
-		if(bufferPos + length < bufferLength) {
-			ret ~= buffer[bufferPos .. bufferPos + length];
-			bufferPos += length;
-			return ret;
-		} else {
-			ret ~= buffer[bufferPos .. bufferLength];
-			length -= bufferLength - bufferPos;
+	/// Loads more data after bufferPos if there is space, otherwise load before
+	/// bufferPos, indicating data is wrapping around.
+	void loadMore() {
+		if (bufferPos == bufferLength) {
+			// we read up all the bytes, start back from 0 for bigger recv buffer
 			bufferPos = 0;
 			bufferLength = 0;
+		}
+
+		ptrdiff_t length;
+		if (bufferLength < bufferPos) {
+			// length wrapped around before pos
+			// try to read up to the byte before bufferPos to not trigger the
+			// bufferPos == bufferLength case
+			length = receiveSocket(buffer[bufferLength .. bufferPos - 1]);
+		} else {
+			length = receiveSocket(buffer[bufferLength .. $]);
+		}
+
+		bufferLength += length;
+		if (bufferLength == buffer.length)
+			bufferLength = 0;
+	}
+
+	void readExact(scope ubyte[] dst) {
+		if (!dst.length)
+			return;
+
+		if (bufferPos == bufferLength)
 			loadMore();
 
-			goto got_more;
+		auto end = bufferPos + dst.length;
+		if (end < buffer.length) {
+			// easy linear copy
+			// receive until bufferLength wrapped around or we have enough bytes
+			while (bufferLength >= bufferPos && end > bufferLength)
+				loadMore();
+			dst[] = buffer[bufferPos .. bufferPos = cast(typeof(bufferPos))end];
+		} else {
+			// copy from wrapping buffer
+			size_t i;
+			while (i < dst.length) {
+				auto remaining = dst.length - i;
+				if (bufferPos < bufferLength) {
+					auto d = min(remaining, bufferLength - bufferPos);
+					dst[i .. i += d] = buffer[bufferPos .. bufferPos += d];
+				} else if (bufferPos > bufferLength) {
+					auto d = buffer.length - bufferPos;
+					if (remaining >= d) {
+						dst[i .. i += d] = buffer[bufferPos .. $];
+						dst[i .. i += bufferLength] = buffer[0 .. bufferPos = bufferLength];
+					} else {
+						dst[i .. i += remaining] = buffer[bufferPos .. bufferPos += remaining];
+					}
+				} else {
+					loadMore();
+				}
+			}
 		}
 	}
 
+	immutable(ubyte)[] readUntilNull() {
+		auto ret = appender!(immutable(ubyte)[]);
+		while (true) {
+			ubyte[] chunk;
+			if (bufferPos < bufferLength) {
+				chunk = buffer[bufferPos .. bufferLength];
+			} else if (bufferPos > bufferLength) {
+				chunk = buffer[bufferPos .. $];
+			} else {
+				loadMore();
+				continue;
+			}
+
+			auto zero = chunk.countUntil(0);
+			if (zero == -1) {
+				ret ~= chunk;
+				bufferPos += chunk.length;
+				if (bufferPos == buffer.length)
+					bufferPos = 0;
+			} else {
+				ret ~= chunk[0 .. zero];
+				bufferPos += zero + 1;
+				return ret.data;
+			}
+		}
+	}
+}
+
+unittest {
+	class MockedSocketReceiveStream : SocketReceiveStream {
+		int maxChunk = 64;
+		ubyte generator = 0;
+
+		this() {
+			super(null);
+		}
+
+		protected override ptrdiff_t receiveSocket(ubyte[] buffer) {
+			if (buffer.length >= maxChunk) {
+				buffer[0 .. maxChunk] = ++generator;
+				return maxChunk;
+			} else {
+				buffer[] = ++generator;
+				return buffer.length;
+			}
+		}
+	}
+
+	auto stream = new MockedSocketReceiveStream();
+	stream.buffer[] = 0;
+	auto b = stream.readBytes(3);
+	assert(b == [1, 1, 1]);
+	assert(stream.buffer[0 .. 64].all!(a => a == 1));
+	assert(stream.buffer[64 .. $].all!(a => a == 0));
+	b = stream.readBytes(3);
+	assert(b == [1, 1, 1]);
+	assert(stream.buffer[64 .. $].all!(a => a == 0));
+	assert(stream.bufferPos == 6);
+	assert(stream.bufferLength == 64);
+	b = stream.readBytes(64);
+	assert(b[0 .. $ - 6].all!(a => a == 1));
+	assert(b[$ - 6 .. $].all!(a => a == 2));
+	assert(stream.bufferPos == 70);
+	assert(stream.bufferLength == 128);
+	b = stream.readBytes(57);
+	assert(b.all!(a => a == 2));
+	assert(stream.bufferPos == 127);
+	assert(stream.bufferLength == 128);
+	b = stream.readBytes(8000);
+	assert(b[0] == 2);
+	assert(b[1 .. 65].all!(a => a == 3));
+	assert(b[65 .. 129].all!(a => a == 4));
+
+	stream.buffer[] = 0;
+	stream.bufferPos = stream.bufferLength = 0;
+	stream.generator = 0;
+	assert(stream.readUntilNull().length == 64 * 255);
 }
 
 struct SendBuffer {
@@ -812,6 +1077,10 @@ struct document {
 			bytesCount += v.size;
 	}
 
+	size_t length() const {
+		return values_.length;
+	}
+
 	const(bson_value)[] values() const {
 		return values_;
 	}
@@ -887,33 +1156,43 @@ struct Decimal128 {
 struct Undefined {}
 
 
-struct toStringVisitor {
+struct ToStringVisitor(T) if (isSomeString!T) {
 	import std.conv;
 
 	// of course this could have been a template but I wrote it out long-form for copy/paste purposes
-	string visit(const double v) { return to!string(v); }
-	string visit(const string v) { return to!string(v); }
-	string visit(const document v) { return to!string(v); }
-	string visit(const const(bson_value)[] v) { return to!string(v); }
-	string visit(const ubyte tag, const ubyte[] v) { return to!string(v); }
-	string visit(const ObjectId v) { return to!string(v); }
-	string visit(const bool v) { return to!string(v); }
-	string visit(const UtcTimestamp v) { return to!string(v); }
-	string visit(const typeof(null)) { return "null"; }
-	string visit(const RegEx v) { return to!string(v); }
-	string visit(const Javascript v) { return to!string(v); }
-	string visit(const int v) { return to!string(v); }
-	string visit(const Undefined) { return "undefined"; }
-	string visit(const Timestamp v) { return to!string(v); }
-	string visit(const long v) { return to!string(v); }
-	string visit(const Decimal128 v) { return to!string(v); }
+	T visit(const double v) { return to!T(v); }
+	T visit(const string v) { return to!T(v); }
+	T visit(const document v) { return to!T(v); }
+	T visit(const const(bson_value)[] v) { return to!T(v); }
+	T visit(const ubyte tag, const ubyte[] v) { return to!T(v); }
+	T visit(const ObjectId v) { return to!T(v); }
+	T visit(const bool v) { return to!T(v); }
+	T visit(const UtcTimestamp v) { return to!T(v); }
+	T visit(const typeof(null)) { return to!T(null); }
+	T visit(const RegEx v) { return to!T(v); }
+	T visit(const Javascript v) { return to!T(v); }
+	T visit(const int v) { return to!T(v); }
+	T visit(const Undefined) { return "undefined".to!T; }
+	T visit(const Timestamp v) { return to!T(v); }
+	T visit(const long v) { return to!T(v); }
+	T visit(const Decimal128 v) { return to!T(v); }
 }
 
-struct get_visitor(T) {
+struct GetVisitor(T) {
 	T visit(V)(const V t) {
-		static if(is(V : T))
-			return t;
-		else throw new Exception("incompatible type");
+		static if (isIntegral!V) {
+			static if(isIntegral!T || isFloatingPoint!T)
+				return cast(T)t;
+			else throw new Exception("incompatible type");
+		} else static if (isFloatingPoint!V) {
+			static if(isFloatingPoint!T)
+				return cast(T)t;
+			else throw new Exception("incompatible type");
+		} else {
+			static if(is(V : T))
+				return t;
+			else throw new Exception("incompatible type");
+		}
 	}
 
 	T visit(ubyte tag, const(ubyte)[] v) {
@@ -928,8 +1207,11 @@ struct bson_value {
 	private const(char)[] e_name;
 
 	// It only allows integer types or const getting in order to work right in the visitor...
-	T get(T)() const if(is(T : double) || is(T == const)) {
-		get_visitor!T v;
+	/// Tries to get the value matching exactly this type. The type will convert
+	/// between different floating point types and integral types as well as
+	/// perform a conversion from integral types to floating point types.
+	T get(T)() const if (__traits(compiles, GetVisitor!T)) {
+		GetVisitor!T v;
 		return visit(v);
 	}
 
@@ -1051,8 +1333,8 @@ struct bson_value {
 	}
 
 	string toString() const {
-		toStringVisitor v;
-		return visit!toStringVisitor(v);
+		ToStringVisitor!string v;
+		return visit(v);
 	}
 
 	private union {
