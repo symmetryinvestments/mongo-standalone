@@ -1,3 +1,9 @@
+/++
+	Standalone Mongo driver implementation.
+
+	Copyright: 2020 Symmetry Investments with portion (c) 2012-2016 Nicolas Gurrola
+	License: Subject to the terms of the MIT license, as written in the included LICENSE.txt file.
++/
 module kaleidic.mongo_standalone;
 
 import std.socket;
@@ -1140,7 +1146,7 @@ struct bson_value {
 	}
 }
 
-/* copy/pasted from arsd.cgi */
+/* copy/pasted from arsd.cgi, used with permission */
 struct Uri {
 	// scheme//userinfo@host:port/path?query#fragment
 
