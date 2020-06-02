@@ -11,11 +11,13 @@ import std.bitmanip;
 import std.socket;
 
 static immutable string mongoDriverName = "mongo-standalone";
-static immutable string mongoDriverVersion = "0.0.3";
+static immutable string mongoDriverVersion = "0.0.4";
 
 // just a demo of how it can be used
 version(none)
 void main() {
+
+
 
 		document doc1 = document([
 			bson_value("foo", 12),
@@ -29,7 +31,8 @@ void main() {
 			])),
 		]);
 
-	auto connection = new MongoConnection("mongodb://testuser:testpassword@localhost/test?slaveOk=true");
+	//auto connection = new MongoConnection("mongodb://testuser:testpassword@localhost/test?slaveOk=true");
+	auto connection = new MongoConnection("mongodb://localhost/test?slaveOk=true", "testuser", "testpassord");
 
 	connection.insert(false, "test.world", [doc1]);
 
@@ -37,9 +40,6 @@ void main() {
 	//writeln(connection.query(0, "world", 0, 1, document.init));
 	auto answer = connection.query("test.world", 0, 0, document.init);
 	writeln(answer);
-	foreach(doc; answer.documents)
-		writeln(doc);
-	writefln("%s", cast(string) connection.stream.buffer[connection.stream.bufferPos .. connection.stream.bufferLength]);
 }
 
 enum QueryFlags {
@@ -220,35 +220,44 @@ class MongoConnection {
 			throw new Exception("Authentication didn't respond 'done'");
 	}
 
-	this(string connectionString) {
-		import std.uri : decode;
+	/++
+		Connects to a Mongo database. You can give a username and password in the
+		connection string if URL encoded, OR you can pass it as arguments to this
+		constructor.
+
+		Please note that username/password in the connectionString will OVERRIDE
+		ones given as separate arguments.
+	+/
+	this(string connectionString, string defaultUsername = null, string defaultPassword = null) {
+		import std.uri : decodeComponent;
 		import std.string;
 
 		auto uri = Uri(connectionString);
 		if(uri.port == 0)
 			uri.port = 27017;
 
-		string host = decode(uri.host);
+		string host = decodeComponent(uri.host);
 		if(host.length == 0)
 			host = "localhost";
 
-		string username;
-		string password;
 		string authDb = "admin";
 		string appName;
 
+		string username = defaultUsername;
+		string password = defaultPassword;
+
 		auto split = uri.userinfo.indexOf(":");
 		if(split != -1) {
-			username = decode(uri.userinfo[0 .. split]);
-			password = decode(uri.userinfo[split + 1 .. $]);
+			username = decodeComponent(uri.userinfo[0 .. split]);
+			password = decodeComponent(uri.userinfo[split + 1 .. $]);
 		}
 		if(uri.path.length > 1)
 			authDb = uri.path[1 .. $];
 
 		foreach(part; uri.query.splitter("&")) {
 			split = part.indexOf("=");
-			auto name = decode(part[0 .. split]);
-			auto value = decode(part[split + 1 .. $]);
+			auto name = decodeComponent(part[0 .. split]);
+			auto value = decodeComponent(part[split + 1 .. $]);
 
 			// https://docs.mongodb.com/manual/reference/connection-string/#connections-connection-options
 			switch(name) {
@@ -1040,14 +1049,25 @@ struct OP_REPLY {
 	size_t current;
 	MongoConnection connection;
 
+	string errorMessage;
+	int errorCode;
+
 	@property bool empty() {
-		return numberReturned == 0;
+		return errorCode != 0 || numberReturned == 0;
 	}
 
 	void popFront() {
 		current++;
 		if(current == numberReturned) {
 			this = connection.getMore(fullCollectionName, numberToReturn, cursorID);
+			if(numberReturned == 1) {
+				auto err = documents[0]["$err"];
+				auto ecode = documents[0]["code"];
+				if(err !is bson_value.init) {
+					errorMessage = err.get!string;
+					errorCode = ecode.get!int;
+				}
+			}
 		}
 	}
 
