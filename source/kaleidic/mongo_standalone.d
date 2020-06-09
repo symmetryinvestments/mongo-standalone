@@ -233,12 +233,21 @@ class MongoConnection {
 		import std.string;
 
 		auto uri = Uri(connectionString);
-		if(uri.port == 0)
-			uri.port = 27017;
 
-		string host = decodeComponent(uri.host);
+		if(uri.hosts.length == 0)
+			throw new Exception("no host given in connection string");
+
+		foreach(ref p; uri.hosts) {
+			if(p.port == 0)
+				p.port = 27017;
+		}
+
+		string host = decodeComponent(uri.hosts[0].host);
 		if(host.length == 0)
 			host = "localhost";
+
+		// FIXME: break up the host into the list and at least
+		// pretend to care about replication sets
 
 		string authDb = "admin";
 		string appName;
@@ -273,7 +282,7 @@ class MongoConnection {
 				socket.connect(new UnixAddress(host));
 			} else throw new Exception("Cannot use unix socket on Windows at this time");
 		} else {
-			socket = new TcpSocket(new InternetAddress(host, cast(ushort) uri.port));
+			socket = new TcpSocket(new InternetAddress(host, cast(ushort) uri.hosts[0].port));
 		}
 
 		stream = new SocketReceiveStream(socket);
@@ -478,6 +487,13 @@ class MongoConnection {
 			data = data[ret .. $];
 		}
 	}
+}
+
+unittest {
+	auto uri = Uri("mongo://test:12,foo:14/");
+	assert(uri.hosts.length == 2);
+	assert(uri.hosts[0] == UriHost("test", 12));
+	assert(uri.hosts[1] == UriHost("foo", 14));
 }
 
 interface IReceiveStream {
@@ -1448,14 +1464,18 @@ struct bson_value {
 	}
 }
 
-/* copy/pasted from arsd.cgi, used with permission */
+struct UriHost {
+	string host;
+	int port;
+}
+
+/* copy/pasted from arsd.cgi, modified for mongo-specific comma behavior. used with permission */
 struct Uri {
 	// scheme//userinfo@host:port/path?query#fragment
 
 	string scheme; /// e.g. "http" in "http://example.com/"
 	string userinfo; /// the username (and possibly a password) in the uri
-	string host; /// the domain name
-	int port; /// port number, if given. Will be zero if a port was not explicitly given
+	UriHost[] hosts;
 	string path; /// e.g. "/folder/file.html" in "http://example.com/folder/file.html"
 	string query; /// the stuff after the ? in a uri
 	string fragment; /// the stuff after the # in a uri.
@@ -1564,13 +1584,31 @@ struct Uri {
 				authority = authority[idx2 + 1 .. $];
 			}
 
-			idx2 = authority.indexOf(":");
-			if(idx2 == -1) {
-				port = 0; // 0 means not specified; we should use the default for the scheme
-				host = authority;
-			} else {
-				host = authority[0 .. idx2];
-				port = to!int(authority[idx2 + 1 .. $]);
+			auto remaining = authority;
+
+			while(remaining.length) {
+				auto idx3 = remaining.indexOf(",");
+				if(idx3 != -1) {
+					authority = remaining[0 .. idx3];
+					remaining = remaining[idx3 + 1 .. $];
+				} else {
+					authority = remaining;
+					remaining = null;
+				}
+
+				string host;
+				int port;
+
+				idx2 = authority.indexOf(":");
+				if(idx2 == -1) {
+					port = 0; // 0 means not specified; we should use the default for the scheme
+					host = authority;
+				} else {
+					host = authority[0 .. idx2];
+					port = to!int(authority[idx2 + 1 .. $]);
+				}
+
+				hosts ~= UriHost(host, port);
 			}
 		}
 
@@ -1605,98 +1643,6 @@ struct Uri {
 		}
 
 		// uriInvalidated = false;
-	}
-
-	private string rebuildUri() const {
-		string ret;
-		if(scheme.length)
-			ret ~= scheme ~ ":";
-		if(userinfo.length || host.length)
-			ret ~= "//";
-		if(userinfo.length)
-			ret ~= userinfo ~ "@";
-		if(host.length)
-			ret ~= host;
-		if(port)
-			ret ~= ":" ~ to!string(port);
-
-		ret ~= path;
-
-		if(query.length)
-			ret ~= "?" ~ query;
-
-		if(fragment.length)
-			ret ~= "#" ~ fragment;
-
-		// uri = ret;
-		// uriInvalidated = false;
-		return ret;
-	}
-
-	/// Converts the broken down parts back into a complete string
-	string toString() const {
-		// if(uriInvalidated)
-			return rebuildUri();
-	}
-
-	/// Returns a new absolute Uri given a base. It treats this one as
-	/// relative where possible, but absolute if not. (If protocol, domain, or
-	/// other info is not set, the new one inherits it from the base.)
-	///
-	/// Browsers use a function like this to figure out links in html.
-	Uri basedOn(in Uri baseUrl) const {
-		Uri n = this; // copies
-		// n.uriInvalidated = true; // make sure we regenerate...
-
-		// userinfo is not inherited... is this wrong?
-
-		// if anything is given in the existing url, we don't use the base anymore.
-		if(n.scheme.empty) {
-			n.scheme = baseUrl.scheme;
-			if(n.host.empty) {
-				n.host = baseUrl.host;
-				if(n.port == 0) {
-					n.port = baseUrl.port;
-					if(n.path.length > 0 && n.path[0] != '/') {
-						auto b = baseUrl.path[0 .. baseUrl.path.lastIndexOf("/") + 1];
-						if(b.length == 0)
-							b = "/";
-						n.path = b ~ n.path;
-					} else if(n.path.length == 0) {
-						n.path = baseUrl.path;
-					}
-				}
-			}
-		}
-
-		n.removeDots();
-
-		return n;
-	}
-
-	void removeDots() {
-		auto parts = this.path.split("/");
-		string[] toKeep;
-		foreach(part; parts) {
-			if(part == ".") {
-				continue;
-			} else if(part == "..") {
-				toKeep = toKeep[0 .. $-1];
-				continue;
-			} else {
-				toKeep ~= part;
-			}
-		}
-
-		this.path = toKeep.join("/");
-	}
-
-	// these are like javascript's location.search and location.hash
-	string search() const {
-		return query.length ? ("?" ~ query) : "";
-	}
-	string hash() const {
-		return fragment.length ? ("#" ~ fragment) : "";
 	}
 }
 /* end */
