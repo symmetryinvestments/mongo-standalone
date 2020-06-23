@@ -17,28 +17,33 @@ static immutable string mongoDriverVersion = "0.0.4";
 version(none)
 void main() {
 
+	/+
+	string omg;
+	foreach(a; 0 .. 8000)
+		omg ~= "a";
 
 
 		document doc1 = document([
 			bson_value("foo", 12),
 			bson_value("bar", 12.4),
 			bson_value("baz", 12L),
-			bson_value("faz", "asdasdsa"),
+			bson_value("faz", omg),
 			bson_value("eaz", RegEx("asdasdsa", "i")),
 			bson_value("asds", null),
 			bson_value("sub", document([
 				bson_value("sub1", 12)
 			])),
 		]);
+		+/
 
 	//auto connection = new MongoConnection("mongodb://testuser:testpassword@localhost/test?slaveOk=true");
-	auto connection = new MongoConnection("mongodb://localhost/test?slaveOk=true", "testuser", "testpassord");
+	auto connection = new MongoConnection("mongodb://localhost/test?slaveOk=true", "testuser", "testpassword");
 
-	connection.insert(false, "test.world", [doc1]);
+	//connection.insert(false, "test.world", [doc1]);
 
 	import std.stdio;
 	//writeln(connection.query(0, "world", 0, 1, document.init));
-	auto answer = connection.query("test.world", 0, 0, document.init);
+	auto answer = connection.query("test.world", 35, 1, document.init, document.init, 1);
 	writeln(answer);
 }
 
@@ -377,7 +382,7 @@ class MongoConnection {
 		send(sb.data);
 	}
 
-	OP_REPLY getMore(const(char)[] fullCollectionName, int numberToReturn, long cursorId) {
+	OP_REPLY getMore(const(char)[] fullCollectionName, int numberToReturn, long cursorId, int limitTotalEntries = int.max) {
 		MsgHeader header;
 
 		header.requestID = ++nextRequestId;
@@ -444,7 +449,7 @@ class MongoConnection {
 		send(sb.data);
 	}
 
-	OP_REPLY query(const(char)[] fullCollectionName, int numberToSkip, int numberToReturn, document query, document returnFieldsSelector = document.init, int flags = 1) {
+	OP_REPLY query(const(char)[] fullCollectionName, int numberToSkip, int numberToReturn, document query, document returnFieldsSelector = document.init, int flags = 1, int limitTotalEntries = int.max) {
 		if(flags == 1)
 			flags = defaultQueryFlags;
 		MsgHeader header;
@@ -470,6 +475,7 @@ class MongoConnection {
 		auto reply = stream.readReply();
 
 		reply.numberToReturn = numberToReturn;
+		reply.limitRemaining = limitTotalEntries;
 		reply.fullCollectionName = fullCollectionName;
 		reply.current = 0;
 		reply.connection = this;
@@ -499,6 +505,7 @@ unittest {
 interface IReceiveStream {
 	final OP_REPLY readReply() {
 		OP_REPLY reply;
+
 
 		reply.header.messageLength = readInt();
 		reply.header.requestID = readInt();
@@ -724,7 +731,7 @@ class SocketReceiveStream : IReceiveStream {
 			// bufferPos == bufferLength case
 			length = receiveSocket(buffer[bufferLength .. bufferPos - 1]);
 		} else {
-			length = receiveSocket(buffer[bufferLength .. $]);
+			length = receiveSocket(buffer[bufferLength .. $ - 1]);
 		}
 
 		bufferLength += length;
@@ -1064,18 +1071,20 @@ struct OP_REPLY {
 	const(char)[] fullCollectionName;
 	size_t current;
 	MongoConnection connection;
+	int limitRemaining = int.max;
 
 	string errorMessage;
 	int errorCode;
 
 	@property bool empty() {
-		return errorCode != 0 || numberReturned == 0;
+		return errorCode != 0 || numberReturned == 0 || limitRemaining <= 0;
 	}
 
 	void popFront() {
+		limitRemaining--;
 		current++;
 		if(current == numberReturned) {
-			this = connection.getMore(fullCollectionName, numberToReturn, cursorID);
+			this = connection.getMore(fullCollectionName, numberToReturn, cursorID, limitRemaining);
 			if(numberReturned == 1) {
 				auto err = documents[0]["$err"];
 				auto ecode = documents[0]["code"];
