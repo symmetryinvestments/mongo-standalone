@@ -66,13 +66,13 @@ class TestingMongoConnection : MongoConnection
 
 	override OP_REPLY query(const(char)[] fullCollectionName, int numberToSkip,
 		int numberToReturn, document query,
-		document returnFieldsSelector = document.init, int flags = 1)
+		document returnFieldsSelector = document.init, int flags = 1, int limit = int.max)
 	{
 		auto saslStart = query["saslStart"];
 		if (saslStart != bson_value.init)
 			didAuthenticate = query["mechanism"].toString();
 
 		return super.query(fullCollectionName, numberToSkip, numberToReturn,
-			query, returnFieldsSelector, flags);
+			query, returnFieldsSelector, flags, limit);
 	}
 }
