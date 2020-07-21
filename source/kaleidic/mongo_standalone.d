@@ -352,6 +352,9 @@ class MongoConnection {
 
 		sb.add(header);
 
+		int zero;
+		sb.add(zero);
+
 		sb.add(fullCollectionName);
 		int flags;
 		if(upsert) flags |= 1;
