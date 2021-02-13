@@ -11,10 +11,10 @@ import std.bitmanip;
 import std.socket;
 
 static immutable string mongoDriverName = "mongo-standalone";
-static immutable string mongoDriverVersion = "0.0.4";
+static immutable string mongoDriverVersion = "0.0.7";
 
 // just a demo of how it can be used
-version(none)
+//version(none)
 void main() {
 
 	/+
@@ -38,6 +38,13 @@ void main() {
 
 	//auto connection = new MongoConnection("mongodb://testuser:testpassword@localhost/test?slaveOk=true");
 	auto connection = new MongoConnection("mongodb://localhost/test?slaveOk=true", "testuser", "testpassword");
+
+	connection.update("test.world", true, false, document([bson_value("_id", ObjectId("5ef17aea55c0abb51fbb53bc"))]),
+		document([
+			//bson_value("_id", ObjectId("5ef17aea55c0abb51fbb53bc")),
+			bson_value("replaced","true")
+		])
+	);
 
 	//connection.insert(false, "test.world", [doc1]);
 
@@ -268,6 +275,8 @@ class MongoConnection {
 		if(uri.path.length > 1)
 			authDb = uri.path[1 .. $];
 
+		bool ssl;
+
 		foreach(part; uri.query.splitter("&")) {
 			split = part.indexOf("=");
 			auto name = decodeComponent(part[0 .. split]);
@@ -277,6 +286,8 @@ class MongoConnection {
 			switch(name) {
 				case "slaveOk": defaultQueryFlags |= QueryFlags.SlaveOk; break;
 				case "appName": appName = value; break;
+				case "authSource": authDb = value; break;
+				case "tls", "ssl": ssl = value == "true"; break;
 				default: throw new Exception("Unsupported mongo db connect option: " ~ name);
 			}
 		}
@@ -287,6 +298,8 @@ class MongoConnection {
 				socket.connect(new UnixAddress(host));
 			} else throw new Exception("Cannot use unix socket on Windows at this time");
 		} else {
+			if(ssl)
+				throw new Exception("ssl/tls connections not supported by this driver");
 			socket = new TcpSocket(new InternetAddress(host, cast(ushort) uri.hosts[0].port));
 		}
 
