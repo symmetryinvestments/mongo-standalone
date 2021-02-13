@@ -11,10 +11,10 @@ import std.bitmanip;
 import std.socket;
 
 static immutable string mongoDriverName = "mongo-standalone";
-static immutable string mongoDriverVersion = "0.0.7";
+static immutable string mongoDriverVersion = "0.0.9";
 
 // just a demo of how it can be used
-//version(none)
+version(Demo)
 void main() {
 
 	/+
