@@ -9,3 +9,5 @@ dub.selections.json
 /mongo-standalone
 *.dll
 *.exe
+
+/test/gridfs/test_gridfs
