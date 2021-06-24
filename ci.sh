@@ -5,3 +5,7 @@ cd test
 pushd auth
 ./test.sh
 popd
+
+pushd gridfs
+./test.sh
+popd
