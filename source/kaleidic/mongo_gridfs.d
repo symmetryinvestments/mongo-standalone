@@ -20,10 +20,7 @@ ubyte[] gridfsReadFile(MongoConnection mongo, const string gridfsBucketName, con
         throw new Exception("Requested file not found.");
     }
 
-    long fileSize = reply.documents[0]["length"].get!long;
-    long chunkSize = reply.documents[0]["chunkSize"].get!long;
-
-    return gridfsReadFileById(mongo, gridfsBucketName, id, fileSize, chunkSize);
+    return gridfsReadFileById(mongo, gridfsBucketName, id);
 }
 
 /++
@@ -43,36 +40,38 @@ ubyte[] gridfsReadFile(MongoConnection mongo, const string gridfsBucketName, con
     if (reply.documents.length != 1) {
         throw new Exception("error: failed to match single file: '" ~ name ~ "'");
     }
-
     ObjectId id = reply.documents[0]["_id"].get!ObjectId;
-    long fileSize = reply.documents[0]["length"].get!long;
-    long chunkSize = reply.documents[0]["chunkSize"].get!long;
 
-    return gridfsReadFileById(mongo, gridfsBucketName, id, fileSize, chunkSize);
+    return gridfsReadFileById(mongo, gridfsBucketName, id);
 }
 
 private ubyte[] gridfsReadFileById(MongoConnection mongo, const string gridfsBucketName,
-                                   const ObjectId id, long fileSize, long chunkSize) {
+                                   const ObjectId id) {
     import std.outbuffer;
 
     OutBuffer contents = new OutBuffer();
-    contents.reserve(fileSize);
-
     string collectionName = gridfsBucketName ~ ".chunks";
 
-    int numChunks = cast(int)((fileSize + chunkSize - 1) / chunkSize);
-    for (int chunkIdx = 0; chunkIdx < numChunks; chunkIdx++) {
-        OP_REPLY reply = mongo.query(collectionName, 0, 1,
-                                     document([bson_value("files_id", id), bson_value("n", chunkIdx)]));
+    OP_REPLY reply = mongo.query(collectionName, 0, int.max,
+                                 document([bson_value("files_id", id)]));
+    if (reply.errorCode != 0) {
+        throw new Exception(reply.errorMessage);
+    }
+
+    foreach (doc; reply.documents) {
+        contents.write(doc["data"].get!(const(ubyte[])));
+    }
+
+    // fetch remaining documents if any
+    while (reply.cursorID != 0) {
+        reply = mongo.getMore(collectionName, int.max, reply.cursorID);
         if (reply.errorCode != 0) {
             throw new Exception(reply.errorMessage);
         }
-        if (reply.documents.length != 1) {
-            throw new Exception("Requested file content not found.");
+        foreach (doc; reply.documents) {
+            contents.write(doc["data"].get!(const(ubyte[])));
         }
-        contents.write(reply.documents[0]["data"].get!(const(ubyte[])));
     }
 
     return contents.toBytes;
 }
-
