@@ -887,8 +887,10 @@ struct SendBuffer {
 	private void size(size_t addition) {
 		if(buffer is null)
 			buffer = backing[];
-		if(position + addition > buffer.length)
-			buffer.length = buffer.length * 2;
+		if(position + addition > buffer.length) {
+                        buffer.length = buffer.length * 2;
+                        size(addition);
+                }
 	}
 
 	void add(const document d) {
@@ -995,6 +997,23 @@ struct SendBuffer {
 		buffer[2] = (sz >> 16) & 0xff;
 		buffer[3] = (sz >> 24) & 0xff;
 	}
+}
+
+unittest {
+        // A test for correct buffer allocation
+        import std.algorithm;
+        import std.range;
+        import std.conv;
+
+        // a large BSON array
+        auto anArray = iota(100000)
+                .enumerate()
+                .map!(tup => bson_value(tup.index.to!string, tup.value))
+                .array();
+
+        auto doc = document([bson_value("array", anArray)]);
+        SendBuffer buf;
+        buf.add(doc);
 }
 
 struct MsgHeader {
