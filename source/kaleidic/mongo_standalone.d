@@ -999,20 +999,20 @@ struct SendBuffer {
 }
 
 unittest {
-        // A test for correct buffer allocation
-        import std.algorithm;
-        import std.range;
-        import std.conv;
+	// A test for correct buffer allocation
+	import std.algorithm;
+	import std.range;
+	import std.conv;
 
-        // a large BSON array
-        auto anArray = iota(100000)
-                .enumerate()
-                .map!(tup => bson_value(tup.index.to!string, tup.value))
-                .array();
+	// a large BSON array
+	auto anArray = iota(100000)
+		.enumerate()
+		.map!(tup => bson_value(tup.index.to!string, tup.value))
+		.array();
 
-        auto doc = document([bson_value("array", anArray)]);
-        SendBuffer buf;
-        buf.add(doc);
+	auto doc = document([bson_value("array", anArray)]);
+	SendBuffer buf;
+	buf.add(doc);
 }
 
 struct MsgHeader {
