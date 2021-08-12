@@ -887,10 +887,9 @@ struct SendBuffer {
 	private void size(size_t addition) {
 		if(buffer is null)
 			buffer = backing[];
-		if(position + addition > buffer.length) {
-                        buffer.length = buffer.length * 2;
-                        size(addition);
-                }
+		while (position + addition > buffer.length) {
+			buffer.length = buffer.length * 2;
+		}
 	}
 
 	void add(const document d) {
