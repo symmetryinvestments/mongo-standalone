@@ -1215,6 +1215,11 @@ struct ObjectId {
 			s = s[2 .. $];
 		}
 	}
+
+	int opCmp(ObjectId id) {
+		import std.algorithm;
+		return cmp(cast(ubyte[])this.v, cast(ubyte[])id.v);
+	}
 }
 struct UtcTimestamp {
 	long v;
