@@ -11,6 +11,14 @@ fi
 dd if=/dev/urandom of=small.bin bs=1K count=1
 dd if=/dev/urandom of=large.bin bs=1M count=100
 
+cleanup() {
+    for file in `ls *.bin`; do
+	mongofiles --quiet -d test_files delete $file >/dev/null
+	rm -f $file
+    done
+}
+trap cleanup EXIT
+
 mongofiles --quiet -d test_files -r put small.bin
 mongofiles --quiet -d test_files -r put large.bin
 
@@ -34,11 +42,3 @@ if [[ -x ./test_gridfs_many ]] ; then
 else
     ls many*.bin | xargs rdmd -g -I../../source test_gridfs_many.d
 fi
-
-cleanup() {
-    for file in `ls *.bin`; do
-	mongofiles --quiet -d test_files delete $file >/dev/null
-	rm -f $file
-    done
-}
-trap cleanup EXIT
