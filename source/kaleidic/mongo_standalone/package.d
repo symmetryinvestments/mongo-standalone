@@ -6,6 +6,10 @@
 +/
 module kaleidic.mongo_standalone;
 
+public import kaleidic.mongo_standalone.impl.common;
+public import kaleidic.mongo_standalone.impl.crud;
+public import kaleidic.mongo_standalone.bson;
+
 import std.array;
 import std.bitmanip;
 import std.socket;
@@ -61,29 +65,6 @@ enum QueryFlags {
 	AwaitData = (1 << 5),
 	Exhaust = (1 << 6),
 	Partial = (1 << 7)
-}
-
-/// Server Wire version indicating supported features
-/// $(LINK https://github.com/mongodb/specifications/blob/master/source/wireversion-featurelist.rst)
-enum WireVersion {
-	/// Pre 2.6 (-2.4)
-	old = 0,
-	/// Server version 2.6
-	v26 = 1,
-	/// Server version 2.6
-	v26_2 = 2,
-	/// Server version 3.0
-	v30 = 3,
-	/// Server version 3.2
-	v32 = 4,
-	/// Server version 3.4
-	v34 = 5,
-	/// Server version 3.6
-	v36 = 6,
-	/// Server version 4.0
-	v40 = 7,
-	/// Server version 4.2
-	v42 = 8,
 }
 
 class MongoConnection {
