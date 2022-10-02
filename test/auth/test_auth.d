@@ -40,15 +40,11 @@ int main(string[] args) {
 		"Expected " ~ expectedAuth ~ " but driver connected with "
 		~ connection.didAuthenticate);
 
-	auto reply = connection.query("test.$cmd", 0, -1, document([
+	auto reply = connection.runCommand("test", document([
 		bson_value("dbStats", 1)
 	]));
 
-	if (reply.documents.length != 1 || reply.documents[0]["ok"].get!double != 1) {
-		writeln("dbStats failed");
-		writeln("reply: ", reply);
-		return 1;
-	}
+	writeln("reply: ", reply);
 
 	writeln("auth succeeded");
 	return 0;
@@ -68,11 +64,20 @@ class TestingMongoConnection : MongoConnection
 		int numberToReturn, document query,
 		document returnFieldsSelector = document.init, int flags = 1, int limit = int.max)
 	{
+		test_doc(query);
+		return super.query(__traits(parameters));
+	}
+
+	override OP_MSG msg(int responseTo, uint flagBits, const document doc)
+	{
+		test_doc(doc);
+		return super.msg(__traits(parameters));
+	}
+
+	private void test_doc(document query)
+	{
 		auto saslStart = query["saslStart"];
 		if (saslStart != bson_value.init)
 			didAuthenticate = query["mechanism"].toString();
-
-		return super.query(fullCollectionName, numberToSkip, numberToReturn,
-			query, returnFieldsSelector, flags, limit);
 	}
 }

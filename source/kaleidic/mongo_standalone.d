@@ -97,14 +97,14 @@ class MongoConnection {
 	WireVersion minWireVersion;
 	/// Reported maximum wire version by the server
 	WireVersion maxWireVersion;
+	/// Set to true if the server supports (and possibly mandates) the use of the OP_MSG protocol
+	bool supportsOpMsg;
 
 	private document handshake(string authDatabase, string username,
 			document application) {
 		import std.compiler : compilerName = name, version_major, version_minor;
 		import std.conv : text, to;
 		import std.system : os;
-
-		auto dbcmd = authDatabase ~ ".$cmd";
 
 		static immutable osType = os.to!string;
 
@@ -150,22 +150,17 @@ class MongoConnection {
 
 		auto cmd = [
 			bson_value("isMaster", 1),
+			bson_value("helloOk", true),
 			bson_value("client", document(client))
 		];
 		if (username.length)
 			cmd ~= bson_value("saslSupportedMechs", authDatabase ~ "." ~ username);
 
-		auto reply = query(dbcmd, 0, -1, document(cmd));
-		if (reply.documents.length != 1 || reply.documents[0]["ok"].get!double != 1)
-			throw new Exception("MongoDB Handshake failed");
-
-		return reply.documents[0];
+		return runCommand(authDatabase, document(cmd), true, "MongoDB Handshake");
 	}
 
 	private void authenticateScramSha1(string authDatabase, string username,
 			string password) {
-		auto dbcmd = authDatabase ~ ".$cmd";
-
 		bson_value conversationId;
 
 		ScramState state;
@@ -182,13 +177,11 @@ class MongoConnection {
 		]);
 
 
-		auto firstReply = query(dbcmd, 0, -1, cmd);
-		if(firstReply.documents.length != 1 || firstReply.documents[0]["ok"].get!double != 1)
-			throw new Exception("Auth failed at first step (username)");
+		auto firstReply = runCommand(authDatabase, cmd, true, "Auth at first step (username)");
 
-		conversationId = cast(bson_value) firstReply.documents[0]["conversationId"];
+		conversationId = cast(bson_value) firstReply["conversationId"];
 
-		auto response = firstReply.documents[0]["payload"].get!(const(ubyte[]));
+		auto response = firstReply["payload"].get!(const(ubyte[]));
 		
 		const digest = makeDigest(username, password);
 
@@ -200,19 +193,14 @@ class MongoConnection {
 			bson_value("payload", payload)
 		]);
 
-		auto secondReply = query(dbcmd, 0, -1, cmd);
-		if(secondReply.documents.length != 1)
-			throw new Exception("Auth error at second step");
+		auto secondReply = runCommand(authDatabase, cmd, true, "Auth at second step");
 
-		if(secondReply.documents[0]["ok"].get!double != 1)
-			throw new Exception("Auth failed at second step (password)");
-
-		auto response2 = secondReply.documents[0]["payload"].get!(const(ubyte[]));
+		auto response2 = secondReply["payload"].get!(const(ubyte[]));
 
 		payload = cast(typeof(payload)) state.finalize(cast(string) response2);
 
 		// newer servers can save a roundtrip (they know the password here already)
-		if(secondReply.documents[0]["done"].get!bool)
+		if(secondReply["done"].get!bool)
 			return;
 
 		cmd = document([
@@ -221,14 +209,8 @@ class MongoConnection {
 			bson_value("payload", payload)
 		]);
 
-		auto finalReply = query(dbcmd, 0, -1, cmd);
-		if(finalReply.documents.length != 1)
-			throw new Exception("Auth error at final step");
-
-		if(finalReply.documents[0]["ok"].get!double != 1)
-			throw new Exception("Auth failed at final step");
-
-		if(!finalReply.documents[0]["done"].get!bool)
+		auto finalReply = runCommand(authDatabase, cmd, true, "Auth at final step");
+		if (!finalReply["done"].get!bool)
 			throw new Exception("Authentication didn't respond 'done'");
 	}
 
@@ -313,6 +295,7 @@ class MongoConnection {
 		minWireVersion = cast(WireVersion)handshakeResponse["minWireVersion"].get!int;
 		maxWireVersion = cast(WireVersion)handshakeResponse["maxWireVersion"].get!int;
 
+		supportsOpMsg = maxWireVersion >= WireVersion.v36;
 		bool supportsScramSha1 = maxWireVersion >= WireVersion.v30;
 		bool supportsScramSha256 = maxWireVersion >= WireVersion.v40;
 
@@ -353,6 +336,26 @@ class MongoConnection {
 						"Cannot authenticate because no common authentication mechanism could be found.");
 			}
 		}
+	}
+
+	document runCommand(scope const(char)[] database, document command,
+		bool errorCheck = true, string what = "MongoDB command")
+	in(database.length, "runCommand requires a database argument") {
+		document ret;
+
+		if (supportsOpMsg) {
+			command = document(command.values ~ bson_value("$db", database.idup));
+			ret = msg(-1, 0, command).buildDocument();
+		} else {
+			auto reply = query(database ~ ".$cmd", 0, -1, command);
+			if (reply.documents.length != 1)
+				throw new Exception(what ~ " failed: didn't get exactly 1 response document");
+			ret = reply.documents[0];
+		}
+
+		if (errorCheck && ret["ok"].get!double != 1)
+			throw new Exception(what ~ " failed: " ~ ret["errmsg"].toString);
+		return ret;
 	}
 
 	void update(const(char)[] fullCollectionName, bool upsert, bool multiupdate, document selector, document update) {
@@ -499,6 +502,28 @@ class MongoConnection {
 		return reply;
 	}
 
+	OP_MSG msg(int responseTo, uint flagBits, const document doc)
+	{
+		MsgHeader header;
+
+		header.requestID = ++nextRequestId;
+		header.responseTo = responseTo;
+		header.opCode = OP.MSG;
+
+		SendBuffer sb;
+
+		const bool hasCRC = (flagBits & (1 << 16)) != 0;
+		assert(!hasCRC, "sending with CRC not yet implemented");
+
+		sb.add(header);
+		sb.add(flagBits);
+		sb.addByte(0);
+		sb.add(doc);
+		send(sb.data);
+		
+		return stream.readMsg();
+	}
+
 	private int nextRequestId;
 
 	private void send(const(ubyte)[] data) {
@@ -541,6 +566,60 @@ interface IReceiveStream {
 		}
 
 		return reply;
+	}
+
+	final OP_MSG readMsg() {
+		OP_MSG msg;
+
+		msg.header.messageLength = readInt();
+		msg.header.requestID = readInt();
+		msg.header.responseTo = readInt();
+		msg.header.opCode = readInt();
+
+		msg.flagBits = readUInt();
+		const bool hasCRC = (msg.flagBits & (1 << 16)) != 0;
+
+		int remaining = cast(int)(msg.header.messageLength - 4 * int.sizeof - msg.flagBits.sizeof);
+		if (hasCRC)
+			remaining -= uint.sizeof; // CRC present
+
+		bool gotSec0;
+		while (remaining > 0) {
+			ubyte payloadType = readByte();
+			remaining--;
+
+			switch (payloadType) {
+				case 0:
+					gotSec0 = true;
+					msg.sections ~= OP_MSG.Section(readBson(remaining));
+					break;
+				case 1:
+					int size = readInt();
+					int sectionRemaining = size;
+					auto identifier = readZeroTerminatedChars();
+					document[] docs;
+					sectionRemaining -= cast(int)(identifier.length + 1);
+					while (sectionRemaining > 0) {
+						docs ~= readBson(sectionRemaining);
+					}
+					msg.sections ~= OP_MSG.Section(identifier, docs);
+					remaining -= sectionRemaining;
+					break;
+				default:
+					throw new Exception("Received unexpected payload section type " ~ payloadType.to!string);
+			}
+		}
+
+		if (hasCRC)
+			msg.checksum = readUInt();
+
+		return msg;
+	}
+
+	final document readBson(ref int remaining) {
+		auto d = readBson();
+		remaining -= d.bytesCount;
+		return d;
 	}
 
 	final document readBson() {
@@ -657,18 +736,15 @@ interface IReceiveStream {
 		return readSmall!1[0];
 	}
 
-	final int readInt() {
-		return readSmall!4.littleEndianToNative!int;
+	final T readSmall(T)() {
+		return readSmall!(T.sizeof).littleEndianToNative!T;
 	}
 
-	final long readLong() {
-		return readSmall!8.littleEndianToNative!long;
-	}
+	alias readInt = readSmall!int;
+	alias readUInt = readSmall!uint;
+	alias readLong = readSmall!long;
+	alias readDouble = readSmall!double;
 
-	final double readDouble() {
-		return readSmall!8.littleEndianToNative!double;
-	}
-	
 	final string readZeroTerminatedChars() {
 		return cast(string) readUntilNull();
 	}
@@ -1083,14 +1159,56 @@ struct OP_KILL_CURSORS {
 	const(long)[] cursorIDs;
 }
 
-/+
 // in mongo 3.6
 struct OP_MSG {
-	MsgHeader header,
+	static struct Section {
+		ubyte payloadType;
+		union {
+			document doc;
+			struct { // sequence;
+				const(char)[] identifier;
+				document[] docs;
+			}
+		}
+
+		this(document d)
+		{
+			payloadType = 0;
+			doc = d;
+		}
+
+		this(const(char)[] identifier, document[] docs)
+		{
+			payloadType = 1;
+			this.identifier = identifier;
+			this.docs = docs;
+		}
+	}
+
+	MsgHeader header;
 	uint flagBits;
-	Section[]
+	Section[] sections;
+	uint checksum;
+
+	document buildDocument() const
+	{
+		document[][string] arrays;
+		document base;
+		foreach (section; sections)
+		{
+			if (section.payloadType == 0)
+				base = section.doc;
+			else if (section.payloadType == 1)
+				arrays[section.identifier] ~= section.docs;
+			else
+				throw new Exception("unknown OP_MSG section type");
+		}
+
+		foreach (ident, arr; arrays)
+			base = document(base.values ~ bson_value(ident, cast(bson_value[])arr.map!"a.values".join));
+		return base;
+	}
 }
-+/
 
 struct OP_REPLY {
 	MsgHeader header;
