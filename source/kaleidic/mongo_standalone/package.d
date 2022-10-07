@@ -81,6 +81,9 @@ class MongoConnection {
 	/// Set to true if the server supports (and possibly mandates) the use of the OP_MSG protocol
 	bool supportsOpMsg;
 
+	/// Default database provided in the connection string. Defaults to `$external`
+	string defaultDB = "$external";
+
 	private document handshake(string authDatabase, string username,
 			document application) {
 		import std.compiler : compilerName = name, version_major, version_minor;
@@ -236,7 +239,7 @@ class MongoConnection {
 			password = decodeComponent(uri.userinfo[split + 1 .. $]);
 		}
 		if(uri.path.length > 1)
-			authDb = uri.path[1 .. $];
+			defaultDB = authDb = uri.path[1 .. $];
 
 		bool ssl;
 
@@ -514,6 +517,64 @@ class MongoConnection {
 				throw new Exception("wtf");
 			data = data[ret .. $];
 		}
+	}
+
+	/// Returns a `MongoDatabase` helper struct with the configured `defaultDB`.
+	MongoDatabase db() {
+		return MongoDatabase(this, defaultDB);
+	}
+
+	/// Returns a `MongoDatabase` helper struct with the given database name.
+	MongoDatabase db(string database) {
+		return MongoDatabase(this, database);
+	}
+
+	/// Returns a `MongoCollection` helper struct with the given database and
+	/// collection names.
+	MongoCollection collection(string database, string collection) {
+		return MongoCollection(this, database, collection);
+	}
+}
+
+struct MongoDatabase {
+	MongoConnection connection;
+	const(char)[] database;
+
+	this(MongoConnection connection, const(char)[] database)
+	in (database.length, "Must provide a non-empty database argument")
+	in (!database.canFind("."),
+		"Database must not contain a dot, maybe you wanted to call connection.getCollection() instead?")
+	{
+		this.connection = connection;
+		this.database = database;
+	}
+
+	document command(document command,
+		bool errorCheck = true,
+		string what = "MongoDB command from " ~ __FILE__)
+	{
+		return connection.runCommand(database, command, errorCheck, what);
+	}
+
+	MongoCollection opIndex(string collection)
+	{
+		return MongoCollection(connection, database, collection);
+	}
+
+	alias getCollection = opIndex;
+}
+
+struct MongoCollection
+{
+	MongoConnection connection;
+	const(char)[] database, collection;
+
+	this(MongoConnection connection, const(char)[] database, const(char)[] collection)
+	in (database.length && collection.length, "Must provide both the database and collection argument")
+	{
+		this.connection = connection;
+		this.database = database;
+		this.collection = collection;
 	}
 }
 
