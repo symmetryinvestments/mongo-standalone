@@ -6,6 +6,10 @@
 +/
 module kaleidic.mongo_standalone;
 
+public import kaleidic.mongo_standalone.impl.common;
+public import kaleidic.mongo_standalone.impl.crud;
+public import kaleidic.mongo_standalone.bson;
+
 import std.array;
 import std.bitmanip;
 import std.socket;
@@ -63,29 +67,6 @@ enum QueryFlags {
 	Partial = (1 << 7)
 }
 
-/// Server Wire version indicating supported features
-/// $(LINK https://github.com/mongodb/specifications/blob/master/source/wireversion-featurelist.rst)
-enum WireVersion {
-	/// Pre 2.6 (-2.4)
-	old = 0,
-	/// Server version 2.6
-	v26 = 1,
-	/// Server version 2.6
-	v26_2 = 2,
-	/// Server version 3.0
-	v30 = 3,
-	/// Server version 3.2
-	v32 = 4,
-	/// Server version 3.4
-	v34 = 5,
-	/// Server version 3.6
-	v36 = 6,
-	/// Server version 4.0
-	v40 = 7,
-	/// Server version 4.2
-	v42 = 8,
-}
-
 class MongoConnection {
 
 	Socket socket;
@@ -97,14 +78,17 @@ class MongoConnection {
 	WireVersion minWireVersion;
 	/// Reported maximum wire version by the server
 	WireVersion maxWireVersion;
+	/// Set to true if the server supports (and possibly mandates) the use of the OP_MSG protocol
+	bool supportsOpMsg;
+
+	/// Default database provided in the connection string. Defaults to `$external`
+	string defaultDB = "$external";
 
 	private document handshake(string authDatabase, string username,
 			document application) {
 		import std.compiler : compilerName = name, version_major, version_minor;
 		import std.conv : text, to;
 		import std.system : os;
-
-		auto dbcmd = authDatabase ~ ".$cmd";
 
 		static immutable osType = os.to!string;
 
@@ -150,22 +134,17 @@ class MongoConnection {
 
 		auto cmd = [
 			bson_value("isMaster", 1),
+			bson_value("helloOk", true),
 			bson_value("client", document(client))
 		];
 		if (username.length)
 			cmd ~= bson_value("saslSupportedMechs", authDatabase ~ "." ~ username);
 
-		auto reply = query(dbcmd, 0, -1, document(cmd));
-		if (reply.documents.length != 1 || reply.documents[0]["ok"].get!double != 1)
-			throw new Exception("MongoDB Handshake failed");
-
-		return reply.documents[0];
+		return runCommand(authDatabase, document(cmd), true, "MongoDB Handshake");
 	}
 
 	private void authenticateScramSha1(string authDatabase, string username,
 			string password) {
-		auto dbcmd = authDatabase ~ ".$cmd";
-
 		bson_value conversationId;
 
 		ScramState state;
@@ -182,13 +161,11 @@ class MongoConnection {
 		]);
 
 
-		auto firstReply = query(dbcmd, 0, -1, cmd);
-		if(firstReply.documents.length != 1 || firstReply.documents[0]["ok"].get!double != 1)
-			throw new Exception("Auth failed at first step (username)");
+		auto firstReply = runCommand(authDatabase, cmd, true, "Auth at first step (username)");
 
-		conversationId = cast(bson_value) firstReply.documents[0]["conversationId"];
+		conversationId = cast(bson_value) firstReply["conversationId"];
 
-		auto response = firstReply.documents[0]["payload"].get!(const(ubyte[]));
+		auto response = firstReply["payload"].get!(const(ubyte[]));
 		
 		const digest = makeDigest(username, password);
 
@@ -200,19 +177,14 @@ class MongoConnection {
 			bson_value("payload", payload)
 		]);
 
-		auto secondReply = query(dbcmd, 0, -1, cmd);
-		if(secondReply.documents.length != 1)
-			throw new Exception("Auth error at second step");
+		auto secondReply = runCommand(authDatabase, cmd, true, "Auth at second step");
 
-		if(secondReply.documents[0]["ok"].get!double != 1)
-			throw new Exception("Auth failed at second step (password)");
-
-		auto response2 = secondReply.documents[0]["payload"].get!(const(ubyte[]));
+		auto response2 = secondReply["payload"].get!(const(ubyte[]));
 
 		payload = cast(typeof(payload)) state.finalize(cast(string) response2);
 
 		// newer servers can save a roundtrip (they know the password here already)
-		if(secondReply.documents[0]["done"].get!bool)
+		if(secondReply["done"].get!bool)
 			return;
 
 		cmd = document([
@@ -221,14 +193,8 @@ class MongoConnection {
 			bson_value("payload", payload)
 		]);
 
-		auto finalReply = query(dbcmd, 0, -1, cmd);
-		if(finalReply.documents.length != 1)
-			throw new Exception("Auth error at final step");
-
-		if(finalReply.documents[0]["ok"].get!double != 1)
-			throw new Exception("Auth failed at final step");
-
-		if(!finalReply.documents[0]["done"].get!bool)
+		auto finalReply = runCommand(authDatabase, cmd, true, "Auth at final step");
+		if (!finalReply["done"].get!bool)
 			throw new Exception("Authentication didn't respond 'done'");
 	}
 
@@ -273,7 +239,7 @@ class MongoConnection {
 			password = decodeComponent(uri.userinfo[split + 1 .. $]);
 		}
 		if(uri.path.length > 1)
-			authDb = uri.path[1 .. $];
+			defaultDB = authDb = uri.path[1 .. $];
 
 		bool ssl;
 
@@ -313,6 +279,7 @@ class MongoConnection {
 		minWireVersion = cast(WireVersion)handshakeResponse["minWireVersion"].get!int;
 		maxWireVersion = cast(WireVersion)handshakeResponse["maxWireVersion"].get!int;
 
+		supportsOpMsg = maxWireVersion >= WireVersion.v36;
 		bool supportsScramSha1 = maxWireVersion >= WireVersion.v30;
 		bool supportsScramSha256 = maxWireVersion >= WireVersion.v40;
 
@@ -353,6 +320,26 @@ class MongoConnection {
 						"Cannot authenticate because no common authentication mechanism could be found.");
 			}
 		}
+	}
+
+	document runCommand(scope const(char)[] database, document command,
+		bool errorCheck = true, string what = "MongoDB command")
+	in(database.length, "runCommand requires a database argument") {
+		document ret;
+
+		if (supportsOpMsg) {
+			command = document(command.values ~ bson_value("$db", database.idup));
+			ret = msg(-1, 0, command).buildDocument();
+		} else {
+			auto reply = query(database ~ ".$cmd", 0, -1, command);
+			if (reply.documents.length != 1)
+				throw new Exception(what ~ " failed: didn't get exactly 1 response document");
+			ret = reply.documents[0];
+		}
+
+		if (errorCheck && ret["ok"].get!double != 1)
+			throw new Exception(what ~ " failed: " ~ ret["errmsg"].toString);
+		return ret;
 	}
 
 	void update(const(char)[] fullCollectionName, bool upsert, bool multiupdate, document selector, document update) {
@@ -499,6 +486,28 @@ class MongoConnection {
 		return reply;
 	}
 
+	OP_MSG msg(int responseTo, uint flagBits, const document doc)
+	{
+		MsgHeader header;
+
+		header.requestID = ++nextRequestId;
+		header.responseTo = responseTo;
+		header.opCode = OP.MSG;
+
+		SendBuffer sb;
+
+		const bool hasCRC = (flagBits & (1 << 16)) != 0;
+		assert(!hasCRC, "sending with CRC not yet implemented");
+
+		sb.add(header);
+		sb.add(flagBits);
+		sb.addByte(0);
+		sb.add(doc);
+		send(sb.data);
+		
+		return stream.readMsg();
+	}
+
 	private int nextRequestId;
 
 	private void send(const(ubyte)[] data) {
@@ -508,6 +517,64 @@ class MongoConnection {
 				throw new Exception("wtf");
 			data = data[ret .. $];
 		}
+	}
+
+	/// Returns a `MongoDatabase` helper struct with the configured `defaultDB`.
+	MongoDatabase db() {
+		return MongoDatabase(this, defaultDB);
+	}
+
+	/// Returns a `MongoDatabase` helper struct with the given database name.
+	MongoDatabase db(string database) {
+		return MongoDatabase(this, database);
+	}
+
+	/// Returns a `MongoCollection` helper struct with the given database and
+	/// collection names.
+	MongoCollection collection(string database, string collection) {
+		return MongoCollection(this, database, collection);
+	}
+}
+
+struct MongoDatabase {
+	MongoConnection connection;
+	const(char)[] database;
+
+	this(MongoConnection connection, const(char)[] database)
+	in (database.length, "Must provide a non-empty database argument")
+	in (!database.canFind("."),
+		"Database must not contain a dot, maybe you wanted to call connection.getCollection() instead?")
+	{
+		this.connection = connection;
+		this.database = database;
+	}
+
+	document command(document command,
+		bool errorCheck = true,
+		string what = "MongoDB command from " ~ __FILE__)
+	{
+		return connection.runCommand(database, command, errorCheck, what);
+	}
+
+	MongoCollection opIndex(string collection)
+	{
+		return MongoCollection(connection, database, collection);
+	}
+
+	alias getCollection = opIndex;
+}
+
+struct MongoCollection
+{
+	MongoConnection connection;
+	const(char)[] database, collection;
+
+	this(MongoConnection connection, const(char)[] database, const(char)[] collection)
+	in (database.length && collection.length, "Must provide both the database and collection argument")
+	{
+		this.connection = connection;
+		this.database = database;
+		this.collection = collection;
 	}
 }
 
@@ -543,9 +610,63 @@ interface IReceiveStream {
 		return reply;
 	}
 
+	final OP_MSG readMsg() {
+		OP_MSG msg;
+
+		msg.header.messageLength = readInt();
+		msg.header.requestID = readInt();
+		msg.header.responseTo = readInt();
+		msg.header.opCode = readInt();
+
+		msg.flagBits = readUInt();
+		const bool hasCRC = (msg.flagBits & (1 << 16)) != 0;
+
+		int remaining = cast(int)(msg.header.messageLength - 4 * int.sizeof - msg.flagBits.sizeof);
+		if (hasCRC)
+			remaining -= uint.sizeof; // CRC present
+
+		bool gotSec0;
+		while (remaining > 0) {
+			ubyte payloadType = readByte();
+			remaining--;
+
+			switch (payloadType) {
+				case 0:
+					gotSec0 = true;
+					msg.sections ~= OP_MSG.Section(readBson(remaining));
+					break;
+				case 1:
+					int size = readInt();
+					int sectionRemaining = size;
+					auto identifier = readZeroTerminatedChars();
+					document[] docs;
+					sectionRemaining -= cast(int)(identifier.length + 1);
+					while (sectionRemaining > 0) {
+						docs ~= readBson(sectionRemaining);
+					}
+					msg.sections ~= OP_MSG.Section(identifier, docs);
+					remaining -= sectionRemaining;
+					break;
+				default:
+					throw new Exception("Received unexpected payload section type " ~ payloadType.to!string);
+			}
+		}
+
+		if (hasCRC)
+			msg.checksum = readUInt();
+
+		return msg;
+	}
+
+	final document readBson(ref int remaining) {
+		auto d = readBson();
+		remaining -= d.bytesCount;
+		return d;
+	}
+
 	final document readBson() {
 		document d;
-		d.bytesCount = readInt();
+		d.bytesCount_ = readInt();
 
 		int remaining = d.bytesCount;
 		remaining -= 4; // length
@@ -657,18 +778,15 @@ interface IReceiveStream {
 		return readSmall!1[0];
 	}
 
-	final int readInt() {
-		return readSmall!4.littleEndianToNative!int;
+	final T readSmall(T)() {
+		return readSmall!(T.sizeof).littleEndianToNative!T;
 	}
 
-	final long readLong() {
-		return readSmall!8.littleEndianToNative!long;
-	}
+	alias readInt = readSmall!int;
+	alias readUInt = readSmall!uint;
+	alias readLong = readSmall!long;
+	alias readDouble = readSmall!double;
 
-	final double readDouble() {
-		return readSmall!8.littleEndianToNative!double;
-	}
-	
 	final string readZeroTerminatedChars() {
 		return cast(string) readUntilNull();
 	}
@@ -1083,14 +1201,56 @@ struct OP_KILL_CURSORS {
 	const(long)[] cursorIDs;
 }
 
-/+
 // in mongo 3.6
 struct OP_MSG {
-	MsgHeader header,
+	static struct Section {
+		ubyte payloadType;
+		union {
+			document doc;
+			struct { // sequence;
+				const(char)[] identifier;
+				document[] docs;
+			}
+		}
+
+		this(document d)
+		{
+			payloadType = 0;
+			doc = d;
+		}
+
+		this(const(char)[] identifier, document[] docs)
+		{
+			payloadType = 1;
+			this.identifier = identifier;
+			this.docs = docs;
+		}
+	}
+
+	MsgHeader header;
 	uint flagBits;
-	Section[]
+	Section[] sections;
+	uint checksum;
+
+	document buildDocument() const
+	{
+		document[][string] arrays;
+		document base;
+		foreach (section; sections)
+		{
+			if (section.payloadType == 0)
+				base = section.doc;
+			else if (section.payloadType == 1)
+				arrays[section.identifier] ~= section.docs;
+			else
+				throw new Exception("unknown OP_MSG section type");
+		}
+
+		foreach (ident, arr; arrays)
+			base = document(base.values ~ bson_value(ident, cast(bson_value[])arr.map!"a.values".join));
+		return base;
+	}
 }
-+/
 
 struct OP_REPLY {
 	MsgHeader header;
@@ -1132,383 +1292,6 @@ struct OP_REPLY {
 
 	@property document front() {
 		return documents[current];
-	}
-}
-
-/* bson */
-
-struct document {
-	private int bytesCount;
-	private const(bson_value)[] values_;
-	private ubyte terminatingZero;
-
-	const(bson_value) opIndex(string name) {
-		foreach(value; values)
-			if(value.name == name)
-				return value;
-		return bson_value.init;
-	}
-
-	this(const(bson_value)[] values) {
-		values_ = values;
-		terminatingZero = 0;
-		foreach(v; values)
-			bytesCount += v.size;
-	}
-
-	size_t length() const {
-		return values_.length;
-	}
-
-	const(bson_value)[] values() const {
-		return values_;
-	}
-
-	string toString(int indent = 0) const {
-		string s;
-
-		s ~= "{\n";
-
-		foreach(value; values) {
-			foreach(i; 0 .. indent + 1) s ~= "\t";
-			s ~= value.name;
-			s ~= ": ";
-			s ~= value.toString();
-			s ~= "\n";
-		}
-
-		foreach(i; 0 .. indent) s ~= "\t";
-		s ~= "}\n";
-
-		return s;
-	}
-}
-
-struct ObjectId {
-	ubyte[12] v;
-	string toString() const {
-		import std.format;
-		return format("ObjectId(%(%02x%))", v[]);
-	}
-
-	this(const ubyte[12] v) {
-		this.v = v;
-	}
-
-	this(string s) {
-		import std.algorithm;
-		if(s.startsWith("ObjectId("))
-			s = s["ObjectId(".length .. $-1];
-		if(s.length != 24)
-			throw new Exception("invalid object id: " ~ s);
-		static int hexToDec(char c) {
-			if(c >= '0' && c <= '9')
-				return c - '0';
-			if(c >= 'A' && c <= 'F')
-				return c - 'A' + 10;
-			if(c >= 'a' && c <= 'f')
-				return c - 'a' + 10;
-			throw new Exception("Invalid hex char " ~ c);
-		}
-		foreach(ref b; v) {
-			b = cast(ubyte) ((hexToDec(s[0]) << 4) | hexToDec(s[1]));
-			s = s[2 .. $];
-		}
-	}
-
-	int opCmp(ObjectId id) {
-		import std.algorithm;
-		return cmp(cast(ubyte[])this.v, cast(ubyte[])id.v);
-	}
-}
-struct UtcTimestamp {
-	long v;
-}
-struct RegEx {
-	const(char)[] regex;
-	const(char)[] flags;
-}
-struct Javascript {
-	string v;
-}
-struct Timestamp {
-	ulong v;
-}
-struct Decimal128 {
-	ubyte[16] v;
-}
-struct Undefined {}
-
-
-struct ToStringVisitor(T) if (isSomeString!T) {
-	import std.conv;
-
-	// of course this could have been a template but I wrote it out long-form for copy/paste purposes
-	T visit(const double v) { return to!T(v); }
-	T visit(const string v) { return to!T(v); }
-	T visit(const document v) { return to!T(v); }
-	T visit(const const(bson_value)[] v) { return to!T(v); }
-	T visit(const ubyte tag, const ubyte[] v) { return to!T(v); }
-	T visit(const ObjectId v) { return to!T(v); }
-	T visit(const bool v) { return to!T(v); }
-	T visit(const UtcTimestamp v) { return to!T(v); }
-	T visit(const typeof(null)) { return to!T(null); }
-	T visit(const RegEx v) { return to!T(v); }
-	T visit(const Javascript v) { return to!T(v); }
-	T visit(const int v) { return to!T(v); }
-	T visit(const Undefined) { return "undefined".to!T; }
-	T visit(const Timestamp v) { return to!T(v); }
-	T visit(const long v) { return to!T(v); }
-	T visit(const Decimal128 v) { return to!T(v); }
-}
-
-struct GetVisitor(T) {
-	T visit(V)(const V t) {
-		static if (isIntegral!V) {
-			static if(isIntegral!T || isFloatingPoint!T)
-				return cast(T)t;
-			else throw new Exception("incompatible type");
-		} else static if (isFloatingPoint!V) {
-			static if(isFloatingPoint!T)
-				return cast(T)t;
-			else throw new Exception("incompatible type");
-		} else {
-			static if(is(V : T))
-				return t;
-			else throw new Exception("incompatible type");
-		}
-	}
-
-	T visit(ubyte tag, const(ubyte)[] v) {
-		static if(is(typeof(v) : T))
-			return v;
-		else throw new Exception("incompatible type " ~ T.stringof);
-	}
-}
-
-struct bson_value {
-	private ubyte tag;
-	private const(char)[] e_name;
-
-	// It only allows integer types or const getting in order to work right in the visitor...
-	/// Tries to get the value matching exactly this type. The type will convert
-	/// between different floating point types and integral types as well as
-	/// perform a conversion from integral types to floating point types.
-	T get(T)() const if (__traits(compiles, GetVisitor!T)) {
-		GetVisitor!T v;
-		return visit(v);
-	}
-
-	const(char)[] name() const {
-		return e_name;
-	}
-
-	this(const(char)[] name, bson_value v) {
-		this = v;
-		e_name = name;
-	}
-
-	this(const(char)[] name, double v) {
-		e_name = name;
-		tag = 0x01;
-		x01 = v;
-	}
-	this(const(char)[] name, string v) {
-		e_name = name;
-		tag = 0x02;
-		x02 = v;
-	}
-	this(const(char)[] name, document v) {
-		e_name = name;
-		tag = 0x03;
-		x03 = v;
-	}
-	this(const(char)[] name, bson_value[] v) {
-		e_name = name;
-		tag = 0x04;
-		const(bson_value)[] n;
-		n.reserve(v.length);
-		import std.conv;
-		foreach(idx, i; v)
-			n ~= bson_value(to!string(idx), i);
-		x04 = document(n);
-	}
-	this(const(char)[] name, const(ubyte)[] v, ubyte tag = 0x00) {
-		e_name = name;
-		this.tag = 0x05;
-		x05_tag = tag;
-		x05_data = v;
-	}
-	this(const(char)[] name, ObjectId v) {
-		e_name = name;
-		tag = 0x07;
-		x07 = v.v;
-	}
-	this(const(char)[] name, bool v) {
-		e_name = name;
-		tag = 0x08;
-		x08 = v;
-	}
-	this(const(char)[] name, UtcTimestamp v) {
-		e_name = name;
-		tag = 0x09;
-		x09 = v.v;
-	}
-	this(const(char)[] name, typeof(null)) {
-		e_name = name;
-		tag = 0x0a;
-	}
-	this(const(char)[] name, RegEx v) {
-		e_name = name;
-		tag = 0x0b;
-		x0b_regex = v.regex;
-		x0b_flags = v.flags;
-	}
-	this(const(char)[] name, Javascript v) {
-		e_name = name;
-		tag = 0x0d;
-		x0d = v.v;
-	}
-	this(const(char)[] name, int v) {
-		e_name = name;
-		tag = 0x10;
-		x10 = v;
-	}
-	this(const(char)[] name, Timestamp v) {
-		e_name = name;
-		tag = 0x11;
-		x11 = v.v;
-	}
-	this(const(char)[] name, long v) {
-		e_name = name;
-		tag = 0x12;
-		x12 = v;
-	}
-	this(const(char)[] name, Decimal128 v) {
-		e_name = name;
-		tag = 0x13;
-		x13 = v.v;
-	}
-
-	auto visit(T)(T t) const {
-		switch(tag) {
-			case 0x00: throw new Exception("invalid bson");
-			case 0x01: return t.visit(x01);
-			case 0x02: return t.visit(x02);
-			case 0x03: return t.visit(x03);
-			case 0x04: return t.visit(x04.values);
-			case 0x05: return t.visit(x05_tag, x05_data);
-			case 0x06: return t.visit(Undefined());
-			case 0x07: return t.visit(ObjectId(x07));
-			case 0x08: return t.visit(x08);
-			case 0x09: return t.visit(UtcTimestamp(x09));
-			case 0x0a: return t.visit(null);
-			case 0x0b: return t.visit(RegEx(x0b_regex, x0b_flags));
-			case 0x0d: return t.visit(Javascript(x0d));
-			case 0x10: return t.visit(x10);
-			case 0x11: return t.visit(Timestamp(x11));
-			case 0x12: return t.visit(x12);
-			case 0x13: return t.visit(Decimal128(x13));
-			default:
-				import std.conv;
-				assert(0, "unsupported tag in bson: " ~ to!string(tag));
-
-		}
-	}
-
-	string toString() const {
-		ToStringVisitor!string v;
-		return visit(v);
-	}
-
-	private union {
-		void* zero;
-		double x01;
-		string x02; // given with an int length preceding and 0 terminator
-		document x03; // child object
-		document x04; // array with indexes as key values
-		struct {
-			ubyte x05_tag;
-			const(ubyte)[] x05_data; // binary data
-		}
-		void* undefined;
-		ubyte[12] x07; // a guid/ ObjectId
-		bool x08;
-		long x09; // utc datetime stamp
-		void* x0a; // null
-		struct {
-			const(char)[] x0b_regex;
-			const(char)[] x0b_flags; // alphabetized
-		}
-		string x0d; // javascript
-		int x10; // integer!!! omg
-		ulong x11; // timestamp
-		long x12; // integer!!!
-		ubyte[16] x13; // decimal 128
-	}
-
-	size_t size() const {
-		auto count = 2 + e_name.length;
-
-		switch(this.tag) {
-			case 0x00: // not supposed to exist!
-				throw new Exception("invalid bson");
-			case 0x01:
-				count += 8;
-			break;
-			case 0x02:
-				count += 5 + x02.length; // length and zero
-			break;
-			case 0x03:
-				count += x03.bytesCount;
-			break;
-			case 0x04:
-				count += x04.bytesCount;
-			break;
-			case 0x05:
-				count += x05_data.length;
-				count += 5; // length and tag
-			break;
-			case 0x06: // undefined
-				// intentionally blank, no additional data
-			break;
-			case 0x07:
-				count += x07.length;
-			break;
-			case 0x08:
-				count++;
-			break;
-			case 0x09:
-				count += 8;
-			break;
-			case 0x0a: // null
-				// intentionally blank, no additional data
-			break;
-			case 0x0b:
-				count += x0b_regex.length + 1;
-				count += x0b_flags.length + 1;
-			break;
-			case 0x0d:
-				count += 5 + x0d.length; // length and zero
-			break;
-			case 0x10:
-				count += 4;
-			break;
-			case 0x11:
-				count += 8;
-			break;
-			case 0x12:
-				count += 8;
-			break;
-			case 0x13:
-				count += x13.length;
-			break;
-			default:
-				import std.conv;
-				assert(0, "unsupported tag in bson: " ~ to!string(tag));
-		}
-
-		return count;
 	}
 }
 
