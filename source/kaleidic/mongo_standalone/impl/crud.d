@@ -2,9 +2,9 @@
 	MongoDB CRUD API struct definitions as per driver specification. This file
 	is mostly identical to vibe.d's `vibe.db.mongo.impl.crud` module.
 
-	Copyright: (c) 2022 Symmetry Investments, (c) 2014-2022 MongoDB specification maintainers
+	Copyright: code and documentation (c) 2022 Symmetry Investments, documentation (c) 2014-2022 MongoDB specification maintainers
 
-	License: Creative Commons Attribution-NonCommercial-ShareAlike 3.0 United States License <https://creativecommons.org/licenses/by-nc-sa/3.0/us/>
+	License: The documentation comments are adapted from https://github.com/mongodb/specifications/blob/master/source/crud/crud.rst#api which is licensed under Creative Commons Attribution-NonCommercial-ShareAlike 3.0 United States License <https://creativecommons.org/licenses/by-nc-sa/3.0/us/>
 +/
 module kaleidic.mongo_standalone.impl.crud;
 
