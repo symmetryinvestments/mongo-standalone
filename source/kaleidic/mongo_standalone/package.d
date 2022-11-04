@@ -43,16 +43,20 @@ void main() {
 	//auto connection = new MongoConnection("mongodb://testuser:testpassword@localhost/test?slaveOk=true");
 	auto connection = new MongoConnection("mongodb://localhost/test?slaveOk=true", "testuser", "testpassword");
 
-	connection.update("test.world", true, false, document([bson_value("_id", ObjectId("5ef17aea55c0abb51fbb53bc"))]),
+	import std.stdio;
+
+	writeln(connection.update("test.world", true, false, document([bson_value("_id", ObjectId("5ef17aea55c0abb51fbb53bc"))]),
 		document([
 			//bson_value("_id", ObjectId("5ef17aea55c0abb51fbb53bc")),
 			bson_value("replaced","true")
 		])
-	);
+	));
 
-	//connection.insert(false, "test.world", [doc1]);
+	/+
+	writeln(connection.insert(false, "test.world",
+		[document([bson_value("test", "lol")])]));// ObjectId("6ef17aea55c0abb51fbb53bc"))])]));
+	+/
 
-	import std.stdio;
 	//writeln(connection.query(0, "world", 0, 1, document.init));
 	auto answer = connection.query("test.world", 35, 1, document.init, document.init, 1);
 	writeln(answer);
@@ -342,47 +346,78 @@ class MongoConnection {
 		return ret;
 	}
 
-	void update(const(char)[] fullCollectionName, bool upsert, bool multiupdate, document selector, document update) {
-		MsgHeader header;
+	// Note: the "ok" in the return value isn't super meaningful!
+	document update(const(char)[] fullCollectionName, bool upsert, bool multiupdate, document selector, document update) {
+		if(supportsOpMsg) {
+			document command = document([
+				bson_value("update", fullCollectionName.idup),
+				bson_value("updates", [
+					document([
+						bson_value("upsert", upsert),
+						bson_value("multi", multiupdate),
+						bson_value("q", selector),
+						bson_value("u", update),
+					]),
+				])
+			]);
 
-		header.requestID = ++nextRequestId;
-		header.opCode = OP.UPDATE;
+			return runCommand(defaultDB, command, true, "update");
+		} else {
+			MsgHeader header;
 
-		SendBuffer sb;
+			header.requestID = ++nextRequestId;
+			header.opCode = OP.UPDATE;
 
-		sb.add(header);
+			SendBuffer sb;
 
-		int zero;
-		sb.add(zero);
+			sb.add(header);
 
-		sb.add(fullCollectionName);
-		int flags;
-		if(upsert) flags |= 1;
-		if(multiupdate) flags |= 2;
-		sb.add(flags);
-		sb.add(selector);
-		sb.add(update);
+			int zero;
+			sb.add(zero);
 
-		send(sb.data);
+			sb.add(fullCollectionName);
+			int flags;
+			if(upsert) flags |= 1;
+			if(multiupdate) flags |= 2;
+			sb.add(flags);
+			sb.add(selector);
+			sb.add(update);
+
+			send(sb.data);
+
+			return document.init;
+		}
 	}
 
-	void insert(bool continueOnError, const(char)[] fullCollectionName, document[] documents) {
-		MsgHeader header;
+	// Note: the "ok" in the return value isn't super meaningful!
+	document insert(bool continueOnError, const(char)[] fullCollectionName, document[] documents) {
+		if(supportsOpMsg) {
+			document command = document([
+				bson_value("insert", fullCollectionName.idup),
+				bson_value("documents", documents)
+			]);
 
-		header.requestID = ++nextRequestId;
-		header.opCode = OP.INSERT;
+			return runCommand(defaultDB, command, true, "insert");
+		} else {
+			MsgHeader header;
 
-		SendBuffer sb;
+			header.requestID = ++nextRequestId;
+			header.opCode = OP.INSERT;
 
-		sb.add(header);
+			SendBuffer sb;
 
-		int flags = continueOnError ? 1 : 0;
-		sb.add(flags);
-		sb.add(fullCollectionName);
-		foreach(doc; documents)
-			sb.add(doc);
+			sb.add(header);
 
-		send(sb.data);
+			int flags = continueOnError ? 1 : 0;
+			sb.add(flags);
+			sb.add(fullCollectionName);
+			foreach(doc; documents)
+				sb.add(doc);
+
+			send(sb.data);
+
+			return document.init;
+		}
 	}
 
 	OP_REPLY getMore(const(char)[] fullCollectionName, int numberToReturn, long cursorId, int limitTotalEntries = int.max) {
@@ -413,24 +448,42 @@ class MongoConnection {
 		return reply;
 	}
 
-	void delete_(const(char)[] fullCollectionName, bool singleRemove, document selector) {
-		MsgHeader header;
+	// Note: the "ok" in the return value isn't super meaningful!
+	document delete_(const(char)[] fullCollectionName, bool singleRemove, document selector) {
+		if(supportsOpMsg) {
+			document command = document([
+				bson_value("delete", fullCollectionName.idup),
+				bson_value("deletes", [
+					document([
+						bson_value("q", selector),
+						bson_value("limit", singleRemove ? 1 : 0),
+					]),
+				])
 
-		header.requestID = ++nextRequestId;
-		header.opCode = OP.DELETE;
+			]);
 
-		SendBuffer sb;
+			return runCommand(defaultDB, command, true, "delete");
+		} else {
+			MsgHeader header;
 
-		sb.add(header);
+			header.requestID = ++nextRequestId;
+			header.opCode = OP.DELETE;
 
-		int zero;
-		sb.add(0);
-		sb.add(fullCollectionName);
-		int flags = singleRemove ? 1 : 0;
-		sb.add(flags);
-		sb.add(selector);
+			SendBuffer sb;
 
-		send(sb.data);
+			sb.add(header);
+
+			int zero;
+			sb.add(0);
+			sb.add(fullCollectionName);
+			int flags = singleRemove ? 1 : 0;
+			sb.add(flags);
+			sb.add(selector);
+
+			send(sb.data);
+
+			return document.init;
+		}
 	}
 
 	void killCursors(const(long)[] cursorIds) {

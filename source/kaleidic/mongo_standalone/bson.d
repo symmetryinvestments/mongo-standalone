@@ -208,6 +208,16 @@ struct bson_value {
 			n ~= bson_value(to!string(idx), i);
 		x04 = document(n);
 	}
+	this(const(char)[] name, document[] v) {
+		e_name = name;
+		tag = 0x04;
+		const(bson_value)[] n;
+		n.reserve(v.length);
+		import std.conv;
+		foreach(idx, i; v)
+			n ~= bson_value(to!string(idx), i);
+		x04 = document(n);
+	}
 	this(const(char)[] name, const(ubyte)[] v, ubyte tag = 0x00) {
 		e_name = name;
 		this.tag = 0x05;
