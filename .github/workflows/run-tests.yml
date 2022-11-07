@@ -7,7 +7,7 @@ jobs:
     strategy:
       matrix:
         dc: [dmd-latest, ldc-latest]
-        mongodb-version: [3.6, 4.0, 4.2, 4.4, 5.0, 6.0]
+        mongodb-version: [3.6, 4.0, 4.2, 4.4, 5.0] # can't test 6.0 yet since the op_query deprecated
 
     runs-on: ubuntu-latest
     steps:
