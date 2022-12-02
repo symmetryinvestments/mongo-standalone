@@ -41,10 +41,22 @@ void main() {
 		+/
 
 	//auto connection = new MongoConnection("mongodb://testuser:testpassword@localhost/test?slaveOk=true");
-	auto connection = new MongoConnection("mongodb://localhost/test?slaveOk=true", "testuser", "testpassword");
+	auto connection = new MongoConnection("mongodb://localhost/test?slaveOk=true&authSource=admin", "testuser", "testpassword");
 
 	import std.stdio;
 
+	version(none)
+	writeln(connection.insert(false, "test.students", [
+		document([
+			bson_value("_id", ObjectId("2ef17aea55c04bb51fbb53bc")),
+			bson_value("name", "test"),
+			bson_value("year", 1),
+			bson_value("score", 4.3),
+			bson_value("sID", 23000)
+		])
+	]));
+
+	version(none)
 	writeln(connection.update("test.world", true, false, document([bson_value("_id", ObjectId("5ef17aea55c0abb51fbb53bc"))]),
 		document([
 			//bson_value("_id", ObjectId("5ef17aea55c0abb51fbb53bc")),
@@ -58,8 +70,12 @@ void main() {
 	+/
 
 	//writeln(connection.query(0, "world", 0, 1, document.init));
-	auto answer = connection.query("test.world", 35, 1, document.init, document.init, 1);
-	writeln(answer);
+
+
+	writeln(connection.query("test.firstYears", 0, 1, document.init, document.init, 1, 3));
+
+	//auto answer = connection.query("test.world", 0, 0, document.init, document.init, 1);
+	//writeln(answer);
 }
 
 enum QueryFlags {
@@ -85,8 +101,8 @@ class MongoConnection {
 	/// Set to true if the server supports (and possibly mandates) the use of the OP_MSG protocol
 	bool supportsOpMsg;
 
-	/// Default database provided in the connection string. Defaults to `$external`
-	string defaultDB = "$external";
+	/// Default database provided in the connection string. Defaults to `admin`
+	string defaultDB = "admin";
 
 	private document handshake(string authDatabase, string username,
 			document application) {
@@ -346,9 +362,21 @@ class MongoConnection {
 		return ret;
 	}
 
+	// in the new style thing you only use the collection name, not the full name including database
+	// in the old style functions it would include the database name. this trims it if it starts with db name
+	// might not be ideal but should keep compatibiltiy
+	private const(char)[] trimDbNameIfNeeded(const(char)[] fullCollectionName) {
+		import std.algorithm;
+		if(fullCollectionName.startsWith(defaultDB ~ ".")) {
+			return fullCollectionName[defaultDB.length + 1 .. $];
+		}
+		return fullCollectionName;
+	}
+
 	// Note: the "ok" in the return value isn't super meaningful!
-	document update(const(char)[] fullCollectionName, bool upsert, bool multiupdate, document selector, document update) {
-		if(supportsOpMsg) {
+	document update(const(char)[] fullCollectionName, bool upsert, bool multiupdate, document selector, document update, bool forceLegacyMode = false) {
+		if(supportsOpMsg && !forceLegacyMode) {
+			fullCollectionName = trimDbNameIfNeeded(fullCollectionName);
 			document command = document([
 				bson_value("update", fullCollectionName.idup),
 				bson_value("updates", [
@@ -390,8 +418,9 @@ class MongoConnection {
 	}
 
 	// Note: the "ok" in the return value isn't super meaningful!
-	document insert(bool continueOnError, const(char)[] fullCollectionName, document[] documents) {
-		if(supportsOpMsg) {
+	document insert(bool continueOnError, const(char)[] fullCollectionName, document[] documents, bool forceLegacyMode = false) {
+		if(supportsOpMsg && !forceLegacyMode) {
+			fullCollectionName = trimDbNameIfNeeded(fullCollectionName);
 			document command = document([
 				bson_value("insert", fullCollectionName.idup),
 				bson_value("documents", documents)
@@ -449,8 +478,9 @@ class MongoConnection {
 	}
 
 	// Note: the "ok" in the return value isn't super meaningful!
-	document delete_(const(char)[] fullCollectionName, bool singleRemove, document selector) {
-		if(supportsOpMsg) {
+	document delete_(const(char)[] fullCollectionName, bool singleRemove, document selector, bool forceLegacyMode = false) {
+		if(supportsOpMsg && !forceLegacyMode) {
+			fullCollectionName = trimDbNameIfNeeded(fullCollectionName);
 			document command = document([
 				bson_value("delete", fullCollectionName.idup),
 				bson_value("deletes", [
@@ -505,38 +535,55 @@ class MongoConnection {
 		send(sb.data);
 	}
 
-	OP_REPLY query(const(char)[] fullCollectionName, int numberToSkip, int numberToReturn, document query, document returnFieldsSelector = document.init, int flags = 1, int limitTotalEntries = int.max) {
+	OP_REPLY query(const(char)[] fullCollectionName, int numberToSkip, int numberToReturn, document query, document returnFieldsSelector = document.init, int flags = 1, int limitTotalEntries = int.max, bool forceLegacyMode = false) {
 		if(flags == 1)
 			flags = defaultQueryFlags;
-		MsgHeader header;
 
-		header.requestID = ++nextRequestId;
-		header.opCode = OP.QUERY;
+		if(supportsOpMsg && !forceLegacyMode) {
+			document command = document([
+				bson_value("find", trimDbNameIfNeeded(fullCollectionName).idup),
+				bson_value("filter", query),
+				bson_value("projection", returnFieldsSelector),
+				bson_value("skip", numberToSkip),
+				bson_value("limit", limitTotalEntries == int.max ? 0 : limitTotalEntries),
+				bson_value("batchSize", numberToReturn > 0 ? numberToReturn : 101),
+			]);
 
-		SendBuffer sb;
+			auto cmdReply = runCommand(defaultDB, command, true, "query");
 
-		sb.add(header);
+			return OP_REPLY.fromDbCommandReply(cmdReply, this, fullCollectionName);
+		} else {
 
-		sb.add(flags);
-		sb.add(fullCollectionName);
-		sb.add(numberToSkip);
-		sb.add(numberToReturn);
-		sb.add(query);
+			MsgHeader header;
 
-		if(returnFieldsSelector != document.init)
-			sb.add(returnFieldsSelector);
+			header.requestID = ++nextRequestId;
+			header.opCode = OP.QUERY;
 
-		send(sb.data);
-		
-		auto reply = stream.readReply();
+			SendBuffer sb;
 
-		reply.numberToReturn = numberToReturn;
-		reply.limitRemaining = limitTotalEntries;
-		reply.fullCollectionName = fullCollectionName;
-		reply.current = 0;
-		reply.connection = this;
+			sb.add(header);
 
-		return reply;
+			sb.add(flags);
+			sb.add(fullCollectionName);
+			sb.add(numberToSkip);
+			sb.add(numberToReturn);
+			sb.add(query);
+
+			if(returnFieldsSelector != document.init)
+				sb.add(returnFieldsSelector);
+
+			send(sb.data);
+			
+			auto reply = stream.readReply();
+
+			reply.numberToReturn = numberToReturn;
+			reply.limitRemaining = limitTotalEntries;
+			reply.fullCollectionName = fullCollectionName;
+			reply.current = 0;
+			reply.connection = this;
+
+			return reply;
+		}
 	}
 
 	OP_MSG msg(int responseTo, uint flagBits, const document doc)
@@ -1323,6 +1370,31 @@ struct OP_REPLY {
 	string errorMessage;
 	int errorCode;
 
+	bool useNewMongoCursor;
+
+	static OP_REPLY fromDbCommandReply(document cmdReply, MongoConnection connection, const(char)[] fullCollectionName) {
+		OP_REPLY op;
+
+		op.connection = connection;
+		op.fullCollectionName = fullCollectionName.idup;
+
+		document cursorInfo = cmdReply["cursor"].get!(document);
+		const(bson_value)[] firstBatch = cursorInfo["firstBatch"].get!(const bson_value[]);
+
+		op.errorCode = 0;
+		op.numberReturned = cast(int) firstBatch.length;
+		op.documents.length = op.numberReturned;
+		foreach(idx, thing; firstBatch)
+			op.documents[idx] = thing.get!document;
+		op.current = 0;
+		op.limitRemaining = int.max;
+
+		op.useNewMongoCursor = true;
+		op.cursorID = cursorInfo["id"].get!long;
+
+		return op;
+	}
+
 	@property bool empty() {
 		return errorCode != 0 || numberReturned == 0 || limitRemaining <= 0;
 	}
@@ -1331,13 +1403,34 @@ struct OP_REPLY {
 		limitRemaining--;
 		current++;
 		if(current == numberReturned) {
-			this = connection.getMore(fullCollectionName, numberToReturn, cursorID, limitRemaining);
-			if(numberReturned == 1) {
-				auto err = documents[0]["$err"];
-				auto ecode = documents[0]["code"];
-				if(err !is bson_value.init) {
-					errorMessage = err.get!string;
-					errorCode = ecode.get!int;
+			if(useNewMongoCursor) {
+				if(cursorID) {
+					auto response = connection.runCommand(connection.defaultDB, document([
+						bson_value("getMore", cursorID),
+						bson_value("collection", connection.trimDbNameIfNeeded(fullCollectionName).idup),
+					]));
+
+					auto cursorInfo = response["cursor"].get!document;
+					cursorID = cursorInfo["id"].get!long;
+					auto nextBatch = cursorInfo["nextBatch"].get!(const bson_value[]);
+
+					numberReturned = cast(int) nextBatch.length;
+					documents.length = numberReturned;
+					foreach(idx, thing; nextBatch)
+						documents[idx] = thing.get!document;
+					current = 0;
+				} else {
+					numberReturned = 0;
+				}
+			} else {
+				this = connection.getMore(fullCollectionName, numberToReturn, cursorID, limitRemaining);
+				if(numberReturned == 1) {
+					auto err = documents[0]["$err"];
+					auto ecode = documents[0]["code"];
+					if(err !is bson_value.init) {
+						errorMessage = err.get!string;
+						errorCode = ecode.get!int;
+					}
 				}
 			}
 		}
