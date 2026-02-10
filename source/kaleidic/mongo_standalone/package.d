@@ -1308,7 +1308,7 @@ struct OP_MSG {
 		union {
 			document doc;
 			struct { // sequence;
-				const(char)[] identifier;
+				string identifier;
 				document[] docs;
 			}
 		}
@@ -1319,7 +1319,7 @@ struct OP_MSG {
 			doc = d;
 		}
 
-		this(const(char)[] identifier, document[] docs)
+		this(string identifier, document[] docs)
 		{
 			payloadType = 1;
 			this.identifier = identifier;
