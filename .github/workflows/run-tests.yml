@@ -8,7 +8,7 @@ jobs:
       fail-fast: false
       matrix:
         dc: [dmd-latest, ldc-latest]
-        mongodb-version: [3.6, 4.0, 4.2, 4.4, 5.0] # can't test 6.0 yet since the op_query deprecated
+        mongodb-version: [4.0, 4.2, 4.4, 5.0] # can't test 6.0 yet since the op_query deprecated; v3.6 is too old for Ubuntu 24's mongosh
 
     runs-on: ubuntu-latest
     steps:
