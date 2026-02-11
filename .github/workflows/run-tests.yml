@@ -24,6 +24,10 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y mongodb-mongosh
         mongosh --version
+    - name: Install mongodb-database-tools
+      run: |
+        wget -q -O mongodb-tools.deb https://fastdl.mongodb.org/tools/db/mongodb-database-tools-ubuntu2404-x86_64-100.14.1.deb
+        sudo apt-get install ./mongodb-tools.deb
     - name: Install D compiler
       uses: mihails-strasuns/setup-dlang@v1
       with:
