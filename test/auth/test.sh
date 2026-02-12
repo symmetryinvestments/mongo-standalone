@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e -x -o pipefail
 
-SERVER_VERSION=$(echo "db.version()" | mongo --quiet)
+SERVER_VERSION=$(echo "db.version()" | mongosh --quiet)
 
 if [[ $SERVER_VERSION == 4* ]]; then
 	echo "
@@ -10,12 +10,12 @@ if [[ $SERVER_VERSION == 4* ]]; then
 	db.runCommand({createUser: 'both', pwd: 'both', roles: ['dbAdmin'], mechanisms: ['SCRAM-SHA-1', 'SCRAM-SHA-256']});
 	db.runCommand({createUser: 'IX', pwd: 'IX', roles: ['dbAdmin'], mechanisms: ['SCRAM-SHA-1']});
 	db.runCommand({createUser: '\u2168', pwd: '\u2163', roles: ['dbAdmin'], mechanisms: ['SCRAM-SHA-256']});
-	" | mongo > /dev/null
+	" | mongosh > /dev/null
 else
 	# MongoDB 3 didn't support SHA-256 yet
 	echo "
 	db.runCommand({createUser: 'sha1', pwd: 'sha1', roles: ['dbAdmin']});
-	" | mongo > /dev/null
+	" | mongosh > /dev/null
 fi
 
 function cleanup {
@@ -25,7 +25,7 @@ function cleanup {
 	db.dropUser('both');
 	db.dropUser('sha256');
 	db.dropUser('sha1');
-	" | mongo > /dev/null
+	" | mongosh > /dev/null
 }
 trap cleanup EXIT
 
